@@ -45,8 +45,11 @@ function folderLabel(file) {
 function summarizeChange(ch) {
   return {
     id: ch.id,
+    toolId: ch.toolId,
     session: ch.session,
     tool: ch.tool,
+    via: ch.via,
+    deleted: !!ch.deleted,
     file: ch.file,
     name: path.basename(ch.file),
     dir: folderLabel(ch.file),
@@ -594,6 +597,10 @@ function diffPreview(c) {
       (c.replaceAll ? '<span class="sep">(replaced every occurrence)</span>' : '') + '</pre>';
   }
   if (c.status === 'failed') return '<div class="note">The edit failed, so the file was not changed.</div>';
+  if (c.via) {
+    const did = c.deleted ? 'Deleted' : c.created ? 'Created' : 'Changed';
+    return '<div class="note">' + did + ' by the ' + esc(c.tool) + ' command “' + esc(c.via) + '”. Open the diff to see the full change.</div>';
+  }
   const what = c.tool === 'MultiEdit' && c.edits ? c.edits + ' edits in one go.' : c.created ? 'New file.' : 'File rewritten.';
   return '<div class="note">' + esc(what) + ' Open the diff to see the full change.</div>';
 }
@@ -837,7 +844,7 @@ document.addEventListener('click', (e) => {
   if (sessionBtn) {
     const item = tab === 'changes' ? changes.find((x) => x.id === selectedChange) : records.find((x) => x.id === selected);
     if (!item || !item.session) return;
-    if (sessionBtn.dataset.session !== 'filter') return vscode.postMessage({ type: 'session', action: sessionBtn.dataset.session, session: item.session, toolId: item.id });
+    if (sessionBtn.dataset.session !== 'filter') return vscode.postMessage({ type: 'session', action: sessionBtn.dataset.session, session: item.session, toolId: item.toolId || item.id });
     sessionFilter = sessionFilter === item.session ? null : item.session;
     save(); renderStats(); renderList(); return renderDetail();
   }

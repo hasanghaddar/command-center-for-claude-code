@@ -203,6 +203,8 @@ class Store {
         kind: 'change',
         session: ev.session,
         tool: ev.tool,
+        toolId: ev.toolId || ev.id, // a shell command's changes share its tool call
+        via: ev.via, // the shell command's description
         file: ev.file,
         cwd: ev.cwd,
         ts: ev.ts,
@@ -228,6 +230,7 @@ class Store {
       }
       ch.endTs = ev.ts;
       ch.after = ev.after;
+      ch.deleted = !!ev.deleted;
       ch.tooLarge = ch.tooLarge || ev.tooLarge;
       ch.status = ev.failed ? 'failed' : 'done';
       ch.error = ev.error;
@@ -412,7 +415,10 @@ async function openChangeDiff(ch, compareCurrent) {
   const left = ch.before && fs.existsSync(ch.before) ? ch.before : emptyFile(ext);
   let right;
   let title;
-  if (compareCurrent || !ch.after || !fs.existsSync(ch.after)) {
+  if (ch.deleted && !compareCurrent) {
+    right = emptyFile(ext);
+    title = `${path.basename(ch.file)} (deleted by Claude ${ch.tool} · ${formatTime(ch.ts)})`;
+  } else if (compareCurrent || !ch.after || !fs.existsSync(ch.after)) {
     if (!fs.existsSync(ch.file)) {
       vscode.window.showWarningMessage(`${ch.file} no longer exists.`);
       return;
@@ -967,11 +973,12 @@ class ChangesProvider {
     else if (ch.status === 'pending') item.iconPath = new vscode.ThemeIcon('sync~spin');
 
     const rel = folderLabel(ch.file);
-    const what = ch.status === 'failed' ? 'failed' : ch.created ? 'new' : ch.tool;
+    const what = ch.status === 'failed' ? 'failed' : ch.deleted ? 'deleted' : ch.created ? 'new' : ch.tool;
     item.description = [what, rel && rel !== '.' ? rel : '', formatTime(ch.ts)].filter(Boolean).join(' · ');
 
     const md = new vscode.MarkdownString();
-    md.appendMarkdown(`**${ch.created ? 'Created' : ch.tool}** · ${new Date(ch.ts).toLocaleString()}\n\n\`${ch.file}\``);
+    md.appendMarkdown(`**${ch.deleted ? 'Deleted' : ch.created ? 'Created' : ch.tool}** · ${new Date(ch.ts).toLocaleString()}\n\n\`${ch.file}\``);
+    if (ch.via) md.appendMarkdown(`\n\nBy the ${ch.tool} command “${ch.via}”`);
     if (ch.error) md.appendCodeblock(ch.error.slice(0, 500));
     item.tooltip = md;
 
@@ -1470,7 +1477,7 @@ function revertPlan(f) {
   const current = readOrNull(f.file);
   const dirty = vscode.workspace.textDocuments.some((d) => d.isDirty && normPath(d.uri.fsPath) === normPath(f.file));
   if (dirty) plan.conflict = 'it has unsaved changes in an editor';
-  else if (!sameBytes(current, readOrNull(f.last.after))) plan.conflict = current == null ? 'it was deleted since' : 'it changed since Claude’s last edit';
+  else if (f.last.deleted ? current != null : !sameBytes(current, readOrNull(f.last.after))) plan.conflict = current == null ? 'it was deleted since' : 'it changed since Claude’s last edit';
   return plan;
 }
 
@@ -1825,7 +1832,7 @@ function activate(context) {
   reg('claudeCommandCenter.showInTranscript', async (rec) => {
     if (!rec || !rec.session) return;
     if (!index.get(rec.session)) await refreshSessions(true);
-    transcripts.open(rec.session, { toolId: rec.id });
+    transcripts.open(rec.session, { toolId: rec.toolId || rec.id });
   });
   reg('claudeCommandCenter.searchSessions', async () => {
     const query = await vscode.window.showInputBox({

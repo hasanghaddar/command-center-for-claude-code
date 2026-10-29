@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 // Claude Code hook: records every Bash/PowerShell tool call, every file edit
-// (with before/after snapshots), and turn ends, subagents and permission
+// (with before/after snapshots, including files a shell command changed in a
+// git repo), and turn ends, subagents and permission
 // prompts, to ~/.claude/command-center/log/events.jsonl so the VS Code
 // extension can show it.
 // It never blocks the tool call: it always exits 0, and prints nothing except
 // a permission decision made in VS Code (see askVsCode).
 
+const cp = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -76,6 +79,184 @@ function buildFileEvent(input, base) {
   const ev = { ...base, type: 'fileEnd', file, failed, after: after.path, tooLarge: after.tooLarge };
   if (failed && input.error) ev.error = clip(typeof input.error === 'string' ? input.error : JSON.stringify(input.error));
   return ev;
+}
+
+// ---------------------------------------------------------------------------
+// Files changed by shell commands. Before a foreground Bash/PowerShell call in
+// a git repo, note HEAD and copy the files that already differ from it. After
+// it, every file that differs from that state was changed by the command; its
+// "before" is the copy, or the file at that HEAD.
+// ---------------------------------------------------------------------------
+
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
+const SHELL_STATE_DIR = path.join(LOG_DIR, 'shell');
+const MAX_DIRTY = 500; // more files than this already changed: don't track
+const MAX_DIRTY_BYTES = 50 * 1024 * 1024;
+const MAX_SHELL_CHANGES = 200;
+const STALE_STATE_MS = 24 * 60 * 60 * 1000;
+
+function git(cwd, args) {
+  return cp.execFileSync('git', args, { cwd, windowsHide: true, timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+}
+
+// Where the command runs: the session's folder, or the one a leading
+// `cd <dir> &&` / `cd <dir>;` moves to.
+function shellDir(input) {
+  const cwd = input.cwd || process.cwd();
+  const m = /^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;|\n)/.exec((input.tool_input || {}).command || '');
+  if (!m) return cwd;
+  const dir = (m[1] || m[2] || m[3]).replace(/^~(?=$|[\\/])/, os.homedir());
+  return path.resolve(cwd, dir);
+}
+
+// Paths (relative to the repo root) that differ from HEAD or the index,
+// untracked ones included.
+function gitDirtyPaths(root) {
+  const out = git(root, ['status', '--porcelain=v1', '-z', '-uall']).toString('utf8').split('\0');
+  const paths = [];
+  for (let i = 0; i < out.length; i++) {
+    const e = out[i];
+    if (e.length < 4) continue;
+    paths.push(e.slice(3));
+    if (e[0] === 'R' || e[0] === 'C') paths.push(out[++i]); // the rename's source
+  }
+  return paths;
+}
+
+// Store contents once per hash, keeping the extension so diffs get the right
+// language. Reusing a copy refreshes its age so it isn't pruned while in use.
+function storeBlob(buf, file) {
+  const dest = path.join(SNAPSHOT_DIR, `blob-${crypto.createHash('sha1').update(buf).digest('hex')}${path.extname(file)}`);
+  try {
+    const now = new Date();
+    fs.utimesSync(dest, now, now);
+  } catch {
+    fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+    fs.writeFileSync(dest, buf);
+  }
+  return dest;
+}
+
+const shellStateFile = (id) => path.join(SHELL_STATE_DIR, `${id.replace(/[^\w.-]/g, '_')}.json`);
+
+function shellBefore(input) {
+  const ti = input.tool_input || {};
+  if (!input.tool_use_id || ti.run_in_background) return; // a background task changes files after its hook has run
+  let root;
+  try {
+    root = git(shellDir(input), ['rev-parse', '--show-toplevel']).toString('utf8').trim();
+  } catch {
+    return; // not in a git repo, or no git
+  }
+  let head = null;
+  try {
+    head = git(root, ['rev-parse', '--verify', '-q', 'HEAD']).toString('utf8').trim();
+  } catch {}
+  const paths = gitDirtyPaths(root);
+  if (paths.length > MAX_DIRTY) return;
+  const dirty = {};
+  let bytes = 0;
+  for (const rel of paths) {
+    const file = path.join(root, rel);
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile()) continue;
+      const entry = { size: st.size, mtime: st.mtimeMs };
+      if (st.size > MAX_SNAPSHOT || bytes + st.size > MAX_DIRTY_BYTES) entry.tooLarge = true;
+      else {
+        entry.blob = storeBlob(fs.readFileSync(file), file);
+        bytes += st.size;
+      }
+      dirty[rel] = entry;
+    } catch {
+      dirty[rel] = { missing: true };
+    }
+  }
+  fs.mkdirSync(SHELL_STATE_DIR, { recursive: true });
+  fs.writeFileSync(shellStateFile(input.tool_use_id), JSON.stringify({ root, head, ts: Date.now(), dirty }));
+  // State left by calls that never finished (denied, or Claude Code quit).
+  try {
+    for (const n of fs.readdirSync(SHELL_STATE_DIR)) {
+      const p = path.join(SHELL_STATE_DIR, n);
+      if (Date.now() - fs.statSync(p).mtimeMs > STALE_STATE_MS) fs.unlinkSync(p);
+    }
+  } catch {}
+}
+
+// fileStart/fileEnd pairs, one per file the command changed.
+function shellAfter(input, base) {
+  if (!input.tool_use_id) return [];
+  const stateFile = shellStateFile(input.tool_use_id);
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    fs.unlinkSync(stateFile);
+  } catch {
+    return [];
+  }
+  const { root, head, dirty } = state;
+  const candidates = new Set([...Object.keys(dirty), ...gitDirtyPaths(root)]);
+  // A commit or checkout during the command: files may now match the new HEAD
+  // but still differ from the one before.
+  let headNow = null;
+  try {
+    headNow = git(root, ['rev-parse', '--verify', '-q', 'HEAD']).toString('utf8').trim();
+  } catch {}
+  if (head && headNow !== head) {
+    for (const rel of git(root, ['diff', '--name-only', '-z', head]).toString('utf8').split('\0')) if (rel) candidates.add(rel);
+  }
+
+  const ti = input.tool_input || {};
+  const via = ti.description || String(ti.command || '').split('\n')[0];
+  const events = [];
+  for (const rel of candidates) {
+    if (events.length >= MAX_SHELL_CHANGES * 2) break;
+    const file = path.join(root, rel);
+    let st = null;
+    try {
+      st = fs.statSync(file);
+      if (!st.isFile()) continue;
+    } catch {}
+    const was = dirty[rel];
+    if (was && !was.missing && st && st.size === was.size && st.mtimeMs === was.mtime) continue; // untouched
+
+    // The file as it was: the copy if it already differed from HEAD, else HEAD's.
+    let before = null;
+    let tooLarge = false;
+    if (was) {
+      if (was.tooLarge) tooLarge = true;
+      else if (was.blob) before = readOrNull(was.blob);
+    } else if (head) {
+      try {
+        before = git(root, ['cat-file', 'blob', `${head}:${rel}`]);
+      } catch {} // not in HEAD
+    }
+    const after = st ? (st.size > MAX_SNAPSHOT ? null : readOrNull(file)) : null;
+    if (st && st.size > MAX_SNAPSHOT) tooLarge = true;
+    if (!tooLarge && before == null && after == null) continue;
+    if (!tooLarge && before && after && Buffer.compare(before, after) === 0) continue;
+
+    const ev = { ...base, id: `${base.id}:${rel}`, toolId: base.id, file, via };
+    events.push({
+      ...ev,
+      type: 'fileStart',
+      ts: state.ts,
+      cwd: input.cwd,
+      existed: was ? !was.missing : before != null,
+      before: before && storeBlob(before, file),
+      tooLarge: tooLarge || undefined,
+    });
+    events.push({ ...ev, type: 'fileEnd', failed: false, after: after && storeBlob(after, file), deleted: !st || undefined, tooLarge: tooLarge || undefined });
+  }
+  return events;
+}
+
+function readOrNull(file) {
+  try {
+    return fs.readFileSync(file);
+  } catch {
+    return null;
+  }
 }
 
 // Session-level events: a turn ending, subagents starting and stopping, and
@@ -270,10 +451,17 @@ process.stdin.on('end', async () => {
       process.exit(0);
     }
     const ev = buildEvent(input);
-    if (ev) {
+    const events = ev ? [ev] : [];
+    if (SHELL_TOOLS.has(input.tool_name)) {
+      try {
+        if (input.hook_event_name === 'PreToolUse') shellBefore(input);
+        else events.push(...shellAfter(input, { session: ev.session, tool: ev.tool, id: ev.id, ts: ev.ts }));
+      } catch {}
+    }
+    if (events.length) {
       fs.mkdirSync(LOG_DIR, { recursive: true });
       rotateIfLarge();
-      fs.appendFileSync(EVENTS_FILE, JSON.stringify(ev) + '\n');
+      fs.appendFileSync(EVENTS_FILE, events.map((e) => JSON.stringify(e) + '\n').join(''));
     }
     // Create ~/.claude/command-center/log/debug to also record the raw hook payloads.
     if (process.env.CLAUDE_COMMAND_CENTER_DEBUG || fs.existsSync(path.join(LOG_DIR, 'debug'))) {

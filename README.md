@@ -30,6 +30,7 @@ One place in VS Code to watch, control and feed context to Claude Code:
 
 **File changes**
 - Every file Claude edits or creates, newest first. **Click one to open its diff**: the file just before and just after that edit.
+- In a git repository, files changed by Claude's **shell commands** (a `sed`, a script, a code generator, `git checkout`) are listed too, with the command that changed them, and can be diffed and reverted like any other edit.
 - **Compare with current** diffs the pre-edit version against the file as it is now.
 
 **Sessions**
@@ -88,7 +89,7 @@ It reads Claude Code's own session transcripts in `~/.claude/projects` for the S
 
 What gets recorded, in `~/.claude/command-center/log/`:
 - **Every command Claude runs, in full, with its output.** If a command contains a token or password, for example a `curl` with an `Authorization` header, it is recorded too.
-- **Copies of files before and after each edit** (`snapshots/`), so diffs can be shown. Files over 5 MB are skipped.
+- **Copies of files before and after each edit** (`snapshots/`), so diffs can be shown. Files over 5 MB are skipped. Before each shell command in a git repository, files that already differ from the last commit are copied too (each version stored once), so the command's changes can be told apart from earlier ones.
 - **The first 300 characters of Claude's last message** at the end of each turn and subagent, and the text of permission prompts, to show in notifications.
 - **Copies of files you revert**, taken just before the revert so it can be undone (`reverts/`).
 - **The text you send with Add to Claude Chat** (`context/`), such as terminal selections, because the chat receives a link to a file rather than the text itself.
@@ -123,7 +124,7 @@ How long it is kept:
 
 - **Foreground output appears when a command finishes**, not while it runs. Claude Code's hooks don't expose output mid-run.
 - **Tested on Windows and macOS.** Linux is supported but not yet verified, Stop in particular: it may not find the process there.
-- **Files changed by shell commands** (such as `sed` or a script) appear in the command list but get no diff, and can't be reverted.
+- **Files changed by shell commands** are only tracked inside a git repository (git-ignored files, such as build output, aren't), and not for background commands, which change files after their hook has run. Changes made by anything else while a command runs, such as another Claude session or a background dev server, are counted as that command's.
 - **Usage is tokens, not a quota percentage.** Your plan's 5-hour and weekly limits aren't stored locally, so the extension can't show how close you are to them.
 - **Open session** uses the Claude Code panel only for sessions in this window's folders; others open in a terminal. A session must be closed before it can be moved, and file paths mentioned earlier in a moved conversation keep their old location.
 - **Answering permission prompts**: while VS Code is asking, the terminal shows no prompt; it appears there once the wait runs out. Answer in one place only.
