@@ -122,7 +122,7 @@ How long it is kept:
 ## Known limitations
 
 - **Foreground output appears when a command finishes**, not while it runs. Claude Code's hooks don't expose output mid-run.
-- **Tested on Windows.** macOS and Linux are supported but not yet verified, Stop in particular: it may not find the process there.
+- **Tested on Windows and macOS.** Linux is supported but not yet verified, Stop in particular: it may not find the process there.
 - **Files changed by shell commands** (such as `sed` or a script) appear in the command list but get no diff, and can't be reverted.
 - **Usage is tokens, not a quota percentage.** Your plan's 5-hour and weekly limits aren't stored locally, so the extension can't show how close you are to them.
 - **Open session** uses the Claude Code panel only for sessions in this window's folders; others open in a terminal. A session must be closed before it can be moved, and file paths mentioned earlier in a moved conversation keep their old location.
