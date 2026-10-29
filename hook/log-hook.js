@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// Claude Code hook: records every Bash/PowerShell tool call, and every file
-// edit (with before/after snapshots), to ~/.claude/command-center/log/events.jsonl
-// so the VS Code extension can show it.
-// It never blocks the tool call: it prints nothing and always exits 0.
+// Claude Code hook: records every Bash/PowerShell tool call, every file edit
+// (with before/after snapshots), and turn ends, subagents and permission
+// prompts, to ~/.claude/command-center/log/events.jsonl so the VS Code
+// extension can show it.
+// It never blocks the tool call: it always exits 0, and prints nothing except
+// a permission decision made in VS Code (see askVsCode).
 
 const fs = require('fs');
 const os = require('os');
@@ -76,7 +78,36 @@ function buildFileEvent(input, base) {
   return ev;
 }
 
+// Session-level events: a turn ending, subagents starting and stopping, and
+// Claude asking for permission or input. They drive the extension's notifications.
+const SESSION_EVENTS = {
+  Stop: 'turnEnd',
+  SubagentStart: 'subagentStart',
+  SubagentStop: 'subagentEnd',
+  Notification: 'attention',
+};
+const MAX_MESSAGE = 300;
+
+function buildSessionEvent(input) {
+  const ev = {
+    type: SESSION_EVENTS[input.hook_event_name],
+    session: input.session_id || null,
+    cwd: input.cwd,
+    ts: Date.now(),
+  };
+  const text = input.last_assistant_message || input.message;
+  if (typeof text === 'string' && text.trim()) {
+    ev.message = text.length > MAX_MESSAGE ? text.slice(0, MAX_MESSAGE) + '…' : text;
+  }
+  if (input.agent_id) ev.agentId = input.agent_id;
+  if (input.agent_type) ev.agentType = input.agent_type;
+  if (input.notification_type) ev.kind = input.notification_type;
+  return ev;
+}
+
 function buildEvent(input) {
+  if (SESSION_EVENTS[input.hook_event_name]) return buildSessionEvent(input);
+
   const ti = input.tool_input || {};
   const base = {
     id: input.tool_use_id || null,
@@ -135,12 +166,109 @@ function buildEvent(input) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Permission requests: for sessions running in a terminal, ask the VS Code
+// window that has the project open, if one has this turned on. It answers by
+// writing permissions/<id>.response.json. If no window is listening, or none
+// answers in time, nothing is printed and Claude Code asks in the terminal.
+// ---------------------------------------------------------------------------
+
+const PERMISSION_DIR = path.join(LOG_DIR, 'permissions');
+const LISTENER_FRESH_MS = 15 * 1000;
+const MAX_TOOL_INPUT = 4 * 1024;
+
+const normPath = (p) => {
+  const s = path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '');
+  return process.platform === 'win32' ? s.toLowerCase() : s;
+};
+
+// Claude Code sessions in its VS Code panel ask there already.
+function inVsCodePanel(sessionId) {
+  if (process.env.CLAUDE_CODE_ENTRYPOINT) return process.env.CLAUDE_CODE_ENTRYPOINT === 'claude-vscode';
+  try {
+    const dir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'sessions');
+    for (const n of fs.readdirSync(dir)) {
+      const s = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8'));
+      if (s.sessionId === sessionId) return s.entrypoint === 'claude-vscode';
+    }
+  } catch {}
+  return false;
+}
+
+// The longest wait among VS Code windows listening for this folder, or 0.
+function listenerTimeout(cwd) {
+  let best = 0;
+  let names = [];
+  try {
+    names = fs.readdirSync(PERMISSION_DIR).filter((n) => /^listener-.*\.json$/.test(n));
+  } catch {}
+  const target = cwd ? normPath(cwd) : '';
+  for (const n of names) {
+    try {
+      const l = JSON.parse(fs.readFileSync(path.join(PERMISSION_DIR, n), 'utf8'));
+      if (Date.now() - l.ts > LISTENER_FRESH_MS) continue;
+      const covers = (l.folders || []).some((f) => target === normPath(f) || target.startsWith(normPath(f) + '/'));
+      if (covers) best = Math.max(best, (l.timeoutSeconds || 60) * 1000);
+    } catch {}
+  }
+  return best;
+}
+
+function clipInput(ti) {
+  const json = JSON.stringify(ti || {});
+  if (json.length <= MAX_TOOL_INPUT) return ti;
+  const out = {};
+  for (const [k, v] of Object.entries(ti)) out[k] = typeof v === 'string' && v.length > 1000 ? v.slice(0, 1000) + '…' : v;
+  return out;
+}
+
+async function askVsCode(input) {
+  if (inVsCodePanel(input.session_id)) return;
+  const timeout = listenerTimeout(input.cwd);
+  if (!timeout) return;
+  const id = `${Date.now()}-${process.pid}`;
+  const request = path.join(PERMISSION_DIR, `${id}.request.json`);
+  const response = path.join(PERMISSION_DIR, `${id}.response.json`);
+  fs.writeFileSync(
+    request,
+    JSON.stringify({ id, session: input.session_id, cwd: input.cwd, tool: input.tool_name, input: clipInput(input.tool_input), ts: Date.now() })
+  );
+  const deadline = Date.now() + timeout;
+  try {
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      let answer;
+      try {
+        answer = JSON.parse(fs.readFileSync(response, 'utf8'));
+      } catch {
+        continue; // not answered yet
+      }
+      const decision =
+        answer.behavior === 'allow'
+          ? { behavior: 'allow' }
+          : { behavior: 'deny', message: answer.message || 'Denied from VS Code.' };
+      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }));
+      return;
+    }
+  } finally {
+    for (const f of [request, response]) {
+      try {
+        fs.unlinkSync(f);
+      } catch {}
+    }
+  }
+}
+
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => (raw += chunk));
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   try {
     const input = JSON.parse(raw);
+    if (input.hook_event_name === 'PermissionRequest') {
+      await askVsCode(input);
+      process.exit(0);
+    }
     const ev = buildEvent(input);
     if (ev) {
       fs.mkdirSync(LOG_DIR, { recursive: true });

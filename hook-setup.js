@@ -6,7 +6,15 @@ const os = require('os');
 const path = require('path');
 
 const MATCHER = 'Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit';
-const EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
+const TOOL_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
+// Registered without a matcher: every turn end, subagent, notification and
+// permission request.
+const SESSION_EVENTS = ['Stop', 'SubagentStart', 'SubagentStop', 'Notification', 'PermissionRequest'];
+// Seconds Claude Code lets the hook run. A permission request can wait for an
+// answer from VS Code (up to the permissionTimeoutSeconds setting, max 300).
+const timeoutFor = (ev) => (ev === 'PermissionRequest' ? 310 : 10);
+const EVENTS = [...TOOL_EVENTS, ...SESSION_EVENTS];
+const matcherFor = (ev) => (TOOL_EVENTS.includes(ev) ? MATCHER : undefined);
 
 function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -152,7 +160,7 @@ function hookStatus() {
       for (const h of m.hooks || []) {
         if (!isOurHook(h)) continue;
         ours++;
-        if (h.command === want && m.matcher === MATCHER) ok++;
+        if (h.command === want && (m.matcher || undefined) === matcherFor(ev)) ok++;
       }
     }
   }
@@ -171,7 +179,9 @@ function registerHooks() {
   s.hooks = s.hooks || {};
   for (const ev of EVENTS) {
     s.hooks[ev] = withoutOurHooks(s.hooks[ev]);
-    s.hooks[ev].push({ matcher: MATCHER, hooks: [{ type: 'command', command: hookCommand(), timeout: 10 }] });
+    const group = { hooks: [{ type: 'command', command: hookCommand(), timeout: timeoutFor(ev) }] };
+    if (matcherFor(ev)) group.matcher = matcherFor(ev);
+    s.hooks[ev].push(group);
   }
   writeSettings(s);
 }
@@ -191,4 +201,4 @@ function unregisterHooks() {
   return changed;
 }
 
-module.exports = { mergeByTime, settingsPath, defaultLogDir, installedHookPath, migrateLegacy, installHookFile, hookStatus, registerHooks, unregisterHooks };
+module.exports = { claudeDir, mergeByTime, settingsPath, defaultLogDir, installedHookPath, migrateLegacy, installHookFile, hookStatus, registerHooks, unregisterHooks };

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0
+
+- **Sessions** view: your Claude Code sessions for this workspace, with titles and which are open or working. Open one in the Claude Code panel or resume it in a terminal.
+- **Transcript viewer**: a session's conversation in a tab, with prompts, replies, thinking and tool calls (merged with their results, edits as diffs), search with ↑/↓ and "only matches", filters, and live following. **Show in Transcript** jumps there from any command or file change, and **Search Sessions…** searches across all sessions.
+- **Move a session to another project**, so Claude Code lists and resumes it there (for example after renaming or moving a project folder).
+- **Notifications** when Claude finishes a turn or needs permission or an answer (by default while the window isn't focused), and optionally when a long subagent finishes.
+- **Token usage** in the status bar: output tokens in the last 5 hours, with today and 7-day totals and a per-model breakdown on hover. Counted from local transcripts.
+- Dashboard: every command and file change shows its session, with **Open session**, **Session diff** and **Only this session**.
+- **Session diff**: all files a session changed in one multi-file diff, or one file across the whole session.
+- **Revert** a session's edits, Claude's last turn, or an edit and everything after it, choosing the files. Files you changed since are left unticked, and **Undo** restores what was there.
+- **Dev servers**: when a background process prints a local URL, open it in your browser or in VS Code. The address shows in the command list.
+- **Answer permission prompts from VS Code** for Claude Code running in a terminal (opt-in): Allow or Deny in the window that has the project open, falling back to the terminal prompt after 60 seconds.
+- **Stop** now works for background tasks started through the PowerShell tool (matched by task ID, since their command isn't on the process command line).
+- The hook now also listens to `Stop`, `SubagentStart`, `SubagentStop` and `Notification`. You'll be asked to update it.
+
 ## 0.8.2
 
 - Commands that Claude Code was denied permission for, or that were cancelled, no longer stay "running" forever. Once past their timeout they show as **No result**.

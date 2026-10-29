@@ -11,6 +11,7 @@ const MAX_INITIAL_OUTPUT = 512 * 1024;
 function summarize(rec) {
   return {
     id: rec.id,
+    session: rec.session,
     tool: rec.tool,
     command: rec.command,
     description: rec.description,
@@ -23,6 +24,7 @@ function summarize(rec) {
     exitCode: rec.exitCode,
     backgroundTaskId: rec.backgroundTaskId,
     outputFile: rec.outputFile,
+    url: rec.url,
   };
 }
 
@@ -43,6 +45,7 @@ function folderLabel(file) {
 function summarizeChange(ch) {
   return {
     id: ch.id,
+    session: ch.session,
     tool: ch.tool,
     file: ch.file,
     name: path.basename(ch.file),
@@ -60,10 +63,11 @@ function summarizeChange(ch) {
 }
 
 class Dashboard {
-  constructor(context, store, findTaskOutput) {
+  constructor(context, store, findTaskOutput, index) {
     this.context = context;
     this.store = store;
     this.findTaskOutput = findTaskOutput;
+    this.index = index;
     this.panel = null;
     this.selected = null;
     this.tailOffset = 0;
@@ -73,11 +77,19 @@ class Dashboard {
     });
   }
 
+  // Open on the Commands tab, showing only one session's commands.
+  showSession(id) {
+    this.show();
+    if (this.ready) this.panel.webview.postMessage({ type: 'filterSession', session: id });
+    else this.pendingSession = id;
+  }
+
   show() {
     if (this.panel) {
       this.panel.reveal();
       return;
     }
+    this.ready = false;
     this.panel = vscode.window.createWebviewPanel('claudeCommandCenter.dashboard', 'Command Center', vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true,
@@ -92,6 +104,7 @@ class Dashboard {
     this.panel.onDidDispose(() => {
       clearInterval(this.tailTimer);
       this.panel = null;
+      this.ready = false;
     });
     this.tailTimer = setInterval(() => this.tail(), 500);
   }
@@ -100,7 +113,10 @@ class Dashboard {
     const rec = msg.id ? this.store.records.get(msg.id) : null;
     switch (msg.type) {
       case 'ready':
+        this.ready = true;
         this.pushState();
+        if (this.pendingSession) this.panel.webview.postMessage({ type: 'filterSession', session: this.pendingSession });
+        this.pendingSession = null;
         if (this.selected) this.sendOutput(true);
         break;
       case 'select':
@@ -117,10 +133,27 @@ class Dashboard {
           current: 'claudeCommandCenter.compareWithCurrent',
           file: 'claudeCommandCenter.openChangedFile',
           chat: 'claudeCommandCenter.addChangeToChat',
+          sessionFile: 'claudeCommandCenter.fileSessionDiff',
+          revertFrom: 'claudeCommandCenter.revertFromHere',
         }[msg.action];
         if (ch && cmd) vscode.commands.executeCommand(cmd, ch);
         break;
       }
+      case 'session':
+        if (msg.action === 'transcript') {
+          vscode.commands.executeCommand('claudeCommandCenter.showInTranscript', { session: msg.session, id: msg.toolId });
+          break;
+        }
+        vscode.commands.executeCommand(
+          {
+            open: 'claudeCommandCenter.openSession',
+            move: 'claudeCommandCenter.moveSession',
+            diff: 'claudeCommandCenter.sessionDiff',
+            revertTurn: 'claudeCommandCenter.revertLastTurn',
+          }[msg.action] || 'claudeCommandCenter.openSession',
+          msg.session
+        );
+        break;
       case 'scope':
         vscode.commands.executeCommand('claudeCommandCenter.toggleScope', msg.scope);
         break;
@@ -136,6 +169,7 @@ class Dashboard {
       feed: 'claudeCommandCenter.openFeed',
       chat: 'claudeCommandCenter.addCommandToChat',
       clear: 'claudeCommandCenter.clear',
+      browser: 'claudeCommandCenter.openUrl',
     }[name];
     if (!cmd) return;
     if (rec) vscode.commands.executeCommand(cmd, rec);
@@ -145,10 +179,21 @@ class Dashboard {
   pushState() {
     if (!this.panel) return;
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.name);
+    const records = this.store.list().map(summarize);
+    const changes = this.store.listChanges().map(summarizeChange);
+    // titles of the sessions shown, from Claude Code's transcripts
+    const sessions = {};
+    for (const r of [...records, ...changes]) {
+      if (!r.session || sessions[r.session]) continue;
+      const s = this.index && this.index.get(r.session);
+      const title = s && (s.title || (s.lastPrompt || '').split(/\r?\n/)[0].trim());
+      sessions[r.session] = { title: title || r.session.slice(0, 8), live: s ? s.live : null };
+    }
     this.panel.webview.postMessage({
       type: 'state',
-      records: this.store.list().map(summarize),
-      changes: this.store.listChanges().map(summarizeChange),
+      records,
+      changes,
+      sessions,
       scope: this.store.scope,
       workspace: folders.join(', '),
     });
@@ -400,10 +445,13 @@ let tab = saved.tab || 'commands';
 let changes = [];
 let selectedChange = saved.selectedChange || null;
 let changeFilter = saved.changeFilter || 'all';
+let sessionFilter = saved.sessionFilter || null;
+let sessions = {};
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-const save = () => vscode.setState({ selected, filter, project, follow, tab, selectedChange, changeFilter });
+const save = () => vscode.setState({ selected, filter, project, follow, tab, selectedChange, changeFilter, sessionFilter });
+const sessionTitle = (id) => (sessions[id] && sessions[id].title) || (id ? id.slice(0, 8) : '—');
 const changeKind = (c) => (c.status === 'failed' ? 'failed' : c.created ? 'created' : 'edited');
 const CHANGE_LABEL = { edited: 'Edited', created: 'Created', failed: 'Failed', pending: 'Saving…' };
 
@@ -469,6 +517,7 @@ function visible() {
     if (filter === 'background' && r.status !== 'background') return false;
     if (filter === 'failed' && !(r.status === 'failed' || r.status === 'interrupted')) return false;
     if (project && r.project !== project) return false;
+    if (sessionFilter && r.session !== sessionFilter) return false;
     if (q && !((r.command || '') + ' ' + (r.description || '') + ' ' + (r.cwd || '')).toLowerCase().includes(q)) return false;
     return true;
   });
@@ -478,9 +527,23 @@ function visibleChanges() {
   const q = query.toLowerCase();
   return changes.filter((c) => {
     if (changeFilter !== 'all' && changeKind(c) !== changeFilter) return false;
+    if (sessionFilter && c.session !== sessionFilter) return false;
     if (q && !(c.file + ' ' + c.tool).toLowerCase().includes(q)) return false;
     return true;
   });
+}
+
+function sessionChip() {
+  if (!sessionFilter) return '';
+  return '<button class="stat on" data-clear-session title="Show every session again">Session: <b>' + esc(sessionTitle(sessionFilter)) + '</b> ✕</button>';
+}
+
+function sessionButtons(id) {
+  if (!id) return '';
+  return '<button class="btn ghost" data-session="open" title="Open the Claude Code session this came from">Open session</button>' +
+    '<button class="btn ghost" data-session="transcript" title="This step in the session’s conversation">Show in transcript</button>' +
+    '<button class="btn ghost" data-session="diff" title="Every file this session changed, first edit to last">Session diff</button>' +
+    '<button class="btn ghost" data-session="filter">' + (sessionFilter === id ? 'All sessions' : 'Only this session') + '</button>';
 }
 
 function renderChangeStats() {
@@ -491,7 +554,7 @@ function renderChangeStats() {
     ['Failed', n('failed'), 's-failed', 'failed'],
     ['Total', changes.length, '', 'all'],
   ];
-  $('stats').innerHTML = chips.map(([label, v, cls, f]) =>
+  $('stats').innerHTML = sessionChip() + chips.map(([label, v, cls, f]) =>
     '<button class="stat ' + cls + (changeFilter === f ? ' on' : '') + '" data-stat="' + f + '" aria-pressed="' + (changeFilter === f) + '"' +
     ' title="' + (f === 'all' ? 'Show all file changes' : 'Show only ' + label.toLowerCase() + ' files') + '">' +
     '<span class="dot"></span>' + label + ' <b>' + v + '</b></button>').join('');
@@ -544,7 +607,7 @@ function renderChangeDetail() {
   }
   const kind = c.status === 'pending' ? 'pending' : changeKind(c);
   const badge = { edited: 'b-background', created: 'b-ok', failed: 'b-failed', pending: 'b-running' }[kind];
-  const facts = [['Tool', c.tool], ['When', new Date(c.ts).toLocaleString()], ['Folder', c.dir || '—']];
+  const facts = [['Tool', c.tool], ['When', new Date(c.ts).toLocaleString()], ['Folder', c.dir || '—'], ['Session', sessionTitle(c.session)]];
   d.innerHTML =
     '<div class="d-head">' +
       '<div class="d-title"><span class="badge ' + badge + '">' + esc(CHANGE_LABEL[kind]) + '</span>' +
@@ -554,6 +617,9 @@ function renderChangeDetail() {
         '<button class="btn ghost" data-change="current" title="Compare the file before this edit with the file as it is now">Compare with current</button>' +
         '<button class="btn ghost" data-change="chat" title="@-mention this file (and the edited lines) in the Claude chat">Add to chat</button>' +
         '<button class="btn ghost" data-change="file">Open file</button>' +
+        (c.session ? '<button class="btn ghost" data-change="sessionFile" title="This file from before the session first edited it to after its last edit">Whole session</button>' : '') +
+        (c.session && c.status !== 'failed' ? '<button class="btn ghost" data-change="revertFrom" title="Undo this edit and every later edit by the same session, file by file">Revert from here…</button>' : '') +
+        sessionButtons(c.session) +
       '</div></div>' +
       '<div class="path">' + esc(c.file) + '</div>' +
       '<div class="facts">' + facts.map(([k, v]) => '<div><span>' + esc(k) + '</span><b>' + esc(v) + '</b></div>').join('') + '</div>' +
@@ -595,7 +661,7 @@ function renderStats() {
     ['Failed', n((r) => r.status === 'failed' || r.status === 'interrupted'), 's-failed', 'failed'],
     ['Total', records.length, '', 'all'],
   ];
-  $('stats').innerHTML = chips.map(([label, v, cls, f]) =>
+  $('stats').innerHTML = sessionChip() + chips.map(([label, v, cls, f]) =>
     '<button class="stat ' + cls + (filter === f ? ' on' : '') + '" data-stat="' + f + '" aria-pressed="' + (filter === f) + '"' +
     ' title="' + (f === 'all' ? 'Show all commands' : 'Show only ' + label.toLowerCase() + ' commands') + '">' +
     '<span class="dot"></span>' + label + ' <b>' + v + '</b></button>').join('');
@@ -656,6 +722,7 @@ function renderDetail() {
     r.exitCode != null ? ['Exit code', r.exitCode] : null,
     r.backgroundTaskId ? ['Task', r.backgroundTaskId] : null,
     ['Folder', r.cwd || '—'],
+    r.session ? ['Session', sessionTitle(r.session)] : null,
   ].filter(Boolean);
   d.innerHTML =
     '<div class="d-head">' +
@@ -663,10 +730,12 @@ function renderDetail() {
       '<h2>' + esc(r.description || firstLine(r.command)) + '</h2>' +
       '<div class="actions">' +
         (r.status === 'background' ? '<button class="btn danger" data-action="stop">Stop</button>' : '') +
+        (r.status === 'background' && r.url ? '<button class="btn" data-action="browser" title="Open in your browser">Open ' + esc(r.url.replace(/^https?:\\/\\//, '')) + '</button>' : '') +
         '<button class="btn ghost" data-action="chat" title="Save the command and its output to a file and @-mention it in the Claude chat">Add to chat</button>' +
         '<button class="btn ghost" data-action="terminal">Open in terminal</button>' +
         '<button class="btn ghost" data-action="rerun">Run again</button>' +
         '<button class="btn ghost" data-action="copy">Copy</button>' +
+        sessionButtons(r.session) +
       '</div></div>' +
       '<div class="facts">' + facts.map(([k, v]) => '<div><span>' + esc(k) + '</span><b>' + esc(v) + '</b></div>').join('') + '</div>' +
       '<pre class="command">$ ' + esc(r.command) + '</pre>' +
@@ -725,7 +794,7 @@ function renderAll() {
     key = c ? 'c' + c.id + c.status : '';
   } else {
     const r = records.find((x) => x.id === selected);
-    key = r ? r.id + r.status + r.endTs + r.exitCode : '';
+    key = r ? r.id + r.status + r.endTs + r.exitCode + (r.url || '') : '';
   }
   if (key !== renderAll.lastKey) { renderAll.lastKey = key; renderDetail(); }
 }
@@ -735,10 +804,15 @@ window.addEventListener('message', (e) => {
   if (msg.type === 'state') {
     records = msg.records;
     changes = msg.changes || [];
+    sessions = msg.sessions || {};
     document.querySelectorAll('#scope button').forEach((b) => b.classList.toggle('on', b.dataset.s === msg.scope));
     $('scope-ws').title = msg.workspace ? 'Commands run inside: ' + msg.workspace : 'No folder open: showing everything';
     if (!selected && records.length) select(records[0].id);
     renderAll();
+  } else if (msg.type === 'filterSession') {
+    sessionFilter = msg.session;
+    save();
+    setTab('commands');
   } else if (msg.type === 'output' && msg.id === selected) {
     output = msg;
     renderOutput();
@@ -758,6 +832,15 @@ document.addEventListener('click', (e) => {
   if (row) return tab === 'changes' ? selectChange(row.dataset.id, true) : select(row.dataset.id);
   const tabBtn = e.target.closest('#tabs button');
   if (tabBtn) return setTab(tabBtn.dataset.tab);
+  if (e.target.closest('[data-clear-session]')) { sessionFilter = null; save(); renderStats(); renderList(); return renderDetail(); }
+  const sessionBtn = e.target.closest('[data-session]');
+  if (sessionBtn) {
+    const item = tab === 'changes' ? changes.find((x) => x.id === selectedChange) : records.find((x) => x.id === selected);
+    if (!item || !item.session) return;
+    if (sessionBtn.dataset.session !== 'filter') return vscode.postMessage({ type: 'session', action: sessionBtn.dataset.session, session: item.session, toolId: item.id });
+    sessionFilter = sessionFilter === item.session ? null : item.session;
+    save(); renderStats(); renderList(); return renderDetail();
+  }
   const changeBtn = e.target.closest('[data-change]');
   if (changeBtn) return vscode.postMessage({ type: 'change', action: changeBtn.dataset.change, id: selectedChange });
   const btn = e.target.closest('[data-action]');

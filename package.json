@@ -1,8 +1,8 @@
 {
   "name": "command-center-for-claude-code",
   "displayName": "Command Center for Claude Code",
-  "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
-  "version": "0.8.2",
+  "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, sessions you can resume or move between projects, notifications, token usage, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
+  "version": "0.9.0",
   "publisher": "hynexia",
   "author": {
     "name": "Hynexia",
@@ -42,7 +42,11 @@
     "terminal",
     "diff",
     "logs",
-    "hooks"
+    "hooks",
+    "sessions",
+    "usage",
+    "notifications",
+    "transcript"
   ],
   "main": "./extension.js",
   "activationEvents": [
@@ -69,6 +73,11 @@
           "id": "claudeCommandCenter.changes",
           "name": "File Changes",
           "icon": "media/icon.svg"
+        },
+        {
+          "id": "claudeCommandCenter.sessions",
+          "name": "Sessions",
+          "icon": "media/icon.svg"
         }
       ]
     },
@@ -80,6 +89,10 @@
       {
         "view": "claudeCommandCenter.changes",
         "contents": "No file changes recorded yet.\n\nEvery file Claude edits shows up here, with a diff.\n[Set up hooks](command:claudeCommandCenter.setup)"
+      },
+      {
+        "view": "claudeCommandCenter.sessions",
+        "contents": "No Claude Code sessions in the last 30 days for this workspace.\n\nSessions are read from ~/.claude/projects."
       }
     ],
     "commands": [
@@ -185,6 +198,91 @@
         "command": "claudeCommandCenter.refresh",
         "title": "Command Center: Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeCommandCenter.openSession",
+        "title": "Open Session",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "claudeCommandCenter.resumeSession",
+        "title": "Resume in Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "claudeCommandCenter.moveSession",
+        "title": "Move to Another Project…",
+        "icon": "$(move)"
+      },
+      {
+        "command": "claudeCommandCenter.showSessionCommands",
+        "title": "Show Commands in Dashboard",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "claudeCommandCenter.copySessionId",
+        "title": "Copy Session ID",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "claudeCommandCenter.revealTranscript",
+        "title": "Reveal Transcript File",
+        "icon": "$(file)"
+      },
+      {
+        "command": "claudeCommandCenter.refreshSessions",
+        "title": "Command Center: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeCommandCenter.sessionDiff",
+        "title": "Open Session Diff (All Files)",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "claudeCommandCenter.fileSessionDiff",
+        "title": "Diff This File Across the Session",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "claudeCommandCenter.revertSession",
+        "title": "Revert Session’s File Changes…",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeCommandCenter.revertLastTurn",
+        "title": "Revert Claude’s Last Turn…",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeCommandCenter.revertFromHere",
+        "title": "Revert This and Later Edits of the Session…",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeCommandCenter.openUrl",
+        "title": "Open in Browser",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "claudeCommandCenter.openUrlInEditor",
+        "title": "Open in VS Code Browser",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "claudeCommandCenter.viewTranscript",
+        "title": "View Transcript",
+        "icon": "$(book)"
+      },
+      {
+        "command": "claudeCommandCenter.showInTranscript",
+        "title": "Show in Transcript",
+        "icon": "$(book)"
+      },
+      {
+        "command": "claudeCommandCenter.searchSessions",
+        "title": "Command Center: Search Sessions…",
+        "icon": "$(search)"
       }
     ],
     "menus": {
@@ -265,12 +363,27 @@
           "command": "claudeCommandCenter.toggleScope",
           "when": "view == claudeCommandCenter.changes",
           "group": "navigation@1"
+        },
+        {
+          "command": "claudeCommandCenter.toggleScope",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeCommandCenter.refreshSessions",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeCommandCenter.searchSessions",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "navigation@0"
         }
       ],
       "view/item/context": [
         {
           "command": "claudeCommandCenter.stop",
-          "when": "view == claudeCommandCenter.commands && viewItem == proc.background",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc.background/",
           "group": "inline@1"
         },
         {
@@ -290,7 +403,7 @@
         },
         {
           "command": "claudeCommandCenter.stop",
-          "when": "view == claudeCommandCenter.commands && viewItem == proc.background",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc.background/",
           "group": "1_actions@3"
         },
         {
@@ -332,6 +445,111 @@
           "command": "claudeCommandCenter.openChangedFile",
           "when": "view == claudeCommandCenter.changes",
           "group": "1_actions@3"
+        },
+        {
+          "command": "claudeCommandCenter.moveSession",
+          "when": "view == claudeCommandCenter.sessions && viewItem == session",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCommandCenter.resumeSession",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeCommandCenter.openSession",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "1_open@1"
+        },
+        {
+          "command": "claudeCommandCenter.resumeSession",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "1_open@2"
+        },
+        {
+          "command": "claudeCommandCenter.showSessionCommands",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "1_open@3"
+        },
+        {
+          "command": "claudeCommandCenter.moveSession",
+          "when": "view == claudeCommandCenter.sessions && viewItem == session",
+          "group": "2_move@1"
+        },
+        {
+          "command": "claudeCommandCenter.copySessionId",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "3_info@1"
+        },
+        {
+          "command": "claudeCommandCenter.revealTranscript",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "3_info@2"
+        },
+        {
+          "command": "claudeCommandCenter.openUrl",
+          "when": "view == claudeCommandCenter.commands && viewItem == proc.background.url",
+          "group": "inline@0"
+        },
+        {
+          "command": "claudeCommandCenter.openUrl",
+          "when": "view == claudeCommandCenter.commands && viewItem == proc.background.url",
+          "group": "0_url@1"
+        },
+        {
+          "command": "claudeCommandCenter.openUrlInEditor",
+          "when": "view == claudeCommandCenter.commands && viewItem == proc.background.url",
+          "group": "0_url@2"
+        },
+        {
+          "command": "claudeCommandCenter.sessionDiff",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "4_changes@1"
+        },
+        {
+          "command": "claudeCommandCenter.revertLastTurn",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "4_changes@2"
+        },
+        {
+          "command": "claudeCommandCenter.revertSession",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "4_changes@3"
+        },
+        {
+          "command": "claudeCommandCenter.fileSessionDiff",
+          "when": "view == claudeCommandCenter.changes",
+          "group": "2_session@1"
+        },
+        {
+          "command": "claudeCommandCenter.sessionDiff",
+          "when": "view == claudeCommandCenter.changes",
+          "group": "2_session@2"
+        },
+        {
+          "command": "claudeCommandCenter.revertFromHere",
+          "when": "view == claudeCommandCenter.changes",
+          "group": "3_revert@1"
+        },
+        {
+          "command": "claudeCommandCenter.viewTranscript",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "inline@0"
+        },
+        {
+          "command": "claudeCommandCenter.viewTranscript",
+          "when": "view == claudeCommandCenter.sessions",
+          "group": "1_open@0"
+        },
+        {
+          "command": "claudeCommandCenter.showInTranscript",
+          "when": "view == claudeCommandCenter.commands",
+          "group": "1_actions@4"
+        },
+        {
+          "command": "claudeCommandCenter.showInTranscript",
+          "when": "view == claudeCommandCenter.changes",
+          "group": "2_session@0"
         }
       ],
       "commandPalette": [
@@ -382,6 +600,66 @@
         {
           "command": "claudeCommandCenter.addTerminalLastOutputToChat",
           "when": "terminalFocus"
+        },
+        {
+          "command": "claudeCommandCenter.openSession",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.resumeSession",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.moveSession",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.showSessionCommands",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.copySessionId",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.revealTranscript",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.sessionDiff",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.fileSessionDiff",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.revertSession",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.revertLastTurn",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.revertFromHere",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.openUrl",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.openUrlInEditor",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.viewTranscript",
+          "when": "false"
+        },
+        {
+          "command": "claudeCommandCenter.showInTranscript",
+          "when": "false"
         }
       ]
     },
@@ -435,6 +713,95 @@
           "type": "string",
           "default": "",
           "description": "Folder the hook writes events.jsonl to. Empty = ~/.claude/command-center/log."
+        },
+        "claudeCommandCenter.notifyTurnEnd": {
+          "type": "string",
+          "enum": [
+            "always",
+            "unfocused",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Always",
+            "Only when this VS Code window is not focused",
+            "Never"
+          ],
+          "default": "unfocused",
+          "description": "Notify when Claude finishes a turn and waits for you, in a project open in this window."
+        },
+        "claudeCommandCenter.notifyAttention": {
+          "type": "string",
+          "enum": [
+            "always",
+            "unfocused",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Always",
+            "Only when this VS Code window is not focused",
+            "Never"
+          ],
+          "default": "unfocused",
+          "description": "Notify when Claude needs permission or an answer before it can continue."
+        },
+        "claudeCommandCenter.notifySubagentEnd": {
+          "type": "string",
+          "enum": [
+            "always",
+            "unfocused",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Always",
+            "Only when this VS Code window is not focused",
+            "Never"
+          ],
+          "default": "never",
+          "description": "Notify when a subagent finishes."
+        },
+        "claudeCommandCenter.notifySubagentMinSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "description": "Only notify about subagents that ran at least this many seconds."
+        },
+        "claudeCommandCenter.showUsage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the tokens Claude Code used in the last 5 hours in the status bar (counted from local transcripts; hover for today and 7 days)."
+        },
+        "claudeCommandCenter.sessionDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "List Claude Code sessions active in the last this many days."
+        },
+        "claudeCommandCenter.notifyServerUrl": {
+          "type": "string",
+          "enum": [
+            "always",
+            "unfocused",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Always",
+            "Only when this VS Code window is not focused",
+            "Never"
+          ],
+          "default": "always",
+          "description": "Offer to open a dev server when a background process Claude started prints a local URL (http://localhost:…)."
+        },
+        "claudeCommandCenter.answerPermissions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Answer the permission prompts of Claude Code sessions running in a terminal from VS Code (Allow / Deny), for projects open in this window. Sessions in the Claude Code panel are not affected. If you don't answer in time, the prompt appears in the terminal as usual."
+        },
+        "claudeCommandCenter.permissionTimeoutSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "maximum": 300,
+          "description": "How long a terminal session waits for an answer from VS Code before asking in the terminal instead."
         }
       }
     }
