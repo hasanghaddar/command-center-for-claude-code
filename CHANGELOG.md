@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1
+
+- File Changes shows the project name for files at the top of a workspace, instead of the full folder path.
+- The dashboard toolbar fits on one line at narrower widths.
+- README: Marketplace install link.
+
 ## 0.8.0 — first public release
 
 - **Commands**: sidebar list and dashboard of every Bash/PowerShell command Claude Code runs, with status, duration, exit code and colored output. Background processes stream their logs live and are marked done when they exit.

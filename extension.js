@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const cp = require('child_process');
-const { Dashboard } = require('./dashboard');
+const { Dashboard, folderLabel } = require('./dashboard');
 const hookSetup = require('./hook-setup');
 
 const ESC = '\x1b[';
@@ -934,7 +934,7 @@ class ChangesProvider {
     if (ch.status === 'failed') item.iconPath = new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
     else if (ch.status === 'pending') item.iconPath = new vscode.ThemeIcon('sync~spin');
 
-    const rel = vscode.workspace.asRelativePath(path.dirname(ch.file), false);
+    const rel = folderLabel(ch.file);
     const what = ch.status === 'failed' ? 'failed' : ch.created ? 'new' : ch.tool;
     item.description = [what, rel && rel !== '.' ? rel : '', formatTime(ch.ts)].filter(Boolean).join(' · ');
 

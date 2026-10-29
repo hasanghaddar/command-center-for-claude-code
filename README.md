@@ -1,5 +1,10 @@
 # Command Center for Claude Code
 
+[![Install from the VS Code Marketplace](https://img.shields.io/badge/VS%20Code%20Marketplace-Install-007BFF?logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=hynexia.command-center-for-claude-code)
+[![License: MIT](https://img.shields.io/badge/license-MIT-1A2B4D)](LICENSE)
+
+Install from VS Code: open the Extensions view (Ctrl+Shift+X), search **Command Center for Claude Code**, and click **Install**. Or run `code --install-extension hynexia.command-center-for-claude-code`.
+
 One place in VS Code to watch, control and feed context to Claude Code:
 
 - **Watch** every shell command it runs, with its output, and every file it edits, with a diff one click away.
@@ -7,6 +12,10 @@ One place in VS Code to watch, control and feed context to Claude Code:
 - **Feed context** to the Claude chat: files, folders, editor and terminal selections, command output.
 
 > **Unofficial.** This extension is made by [Hynexia](https://hynexia.net) and is not affiliated with or endorsed by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic.
+
+![The Command Center dashboard: command list with filters, and a selected command's details and output](media/screenshot-dashboard.png)
+
+<img src="media/screenshot-sidebar.png" alt="The Command Center sidebar: Commands and File Changes" width="320">
 
 ## Features
 
@@ -31,7 +40,7 @@ One place in VS Code to watch, control and feed context to Claude Code:
 
 ## Getting started
 
-1. Install the extension.
+1. Install the extension from the Marketplace (see above).
 2. When it asks **"Set up Command Center for Claude Code?"**, click **Enable**.
 3. Start a new Claude Code session. Commands and edits now appear in the **Command Center** sidebar. Open the dashboard from the status bar.
 

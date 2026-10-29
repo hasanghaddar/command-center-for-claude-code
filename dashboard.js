@@ -29,13 +29,24 @@ function summarize(rec) {
 const PREVIEW_MAX = 16 * 1024;
 const clipPreview = (s) => (typeof s === 'string' && s.length > PREVIEW_MAX ? s.slice(0, PREVIEW_MAX) + '\n…' : s);
 
+// Short folder label for a changed file: "src/lib" inside a workspace, the
+// project's name for files at a workspace root (asRelativePath returns a root
+// folder's full path unchanged), the full folder otherwise.
+function folderLabel(file) {
+  const dir = path.dirname(file);
+  const rel = vscode.workspace.asRelativePath(dir, false);
+  if (rel !== dir) return rel;
+  const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file));
+  return folder ? folder.name : dir;
+}
+
 function summarizeChange(ch) {
   return {
     id: ch.id,
     tool: ch.tool,
     file: ch.file,
     name: path.basename(ch.file),
-    dir: vscode.workspace.asRelativePath(path.dirname(ch.file), false),
+    dir: folderLabel(ch.file),
     status: ch.status,
     created: !!ch.created,
     ts: ch.ts,
@@ -301,9 +312,9 @@ button.stat.on { border-color: var(--accent); background: var(--vscode-button-se
 .note { padding: 16px 18px; color: var(--muted); line-height: 1.6; }
 .path { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-#search { flex: 1 1 260px; min-width: 160px; padding: 5px 9px; border-radius: 4px; border: 1px solid var(--vscode-input-border, var(--border)); background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; }
+#search { flex: 1 1 180px; min-width: 140px; padding: 5px 9px; border-radius: 4px; border: 1px solid var(--vscode-input-border, var(--border)); background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; }
 #search:focus, select:focus, button:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
-select { padding: 4px 6px; border-radius: 4px; border: 1px solid var(--vscode-dropdown-border, var(--border)); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); font: inherit; }
+select { max-width: 170px; padding: 4px 6px; border-radius: 4px; border: 1px solid var(--vscode-dropdown-border, var(--border)); background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); font: inherit; }
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
 .seg button { background: transparent; border: 0; padding: 4px 11px; cursor: pointer; color: var(--muted); }
 .seg button + button { border-left: 1px solid var(--border); }
@@ -811,4 +822,4 @@ vscode.postMessage({ type: 'ready' });
 if (selected) vscode.postMessage({ type: 'select', id: selected });
 `;
 
-module.exports = { Dashboard };
+module.exports = { Dashboard, folderLabel };
