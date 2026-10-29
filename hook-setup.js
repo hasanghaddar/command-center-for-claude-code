@@ -58,6 +58,24 @@ function rewriteEvents(text, fromRoot, toRoot) {
   return text.split(json(fromRoot)).join(json(toRoot));
 }
 
+// Event lines from several files, sorted by their timestamp (stable, so lines
+// with equal or missing times keep their order).
+function mergeByTime(...texts) {
+  const lines = texts.flatMap((t) => t.split('\n').filter((l) => l.trim()));
+  const ts = (l) => {
+    try {
+      return JSON.parse(l).ts || 0;
+    } catch {
+      return 0;
+    }
+  };
+  return lines
+    .map((l, i) => ({ l, i, t: ts(l) }))
+    .sort((a, b) => a.t - b.t || a.i - b.i)
+    .map((x) => x.l + '\n')
+    .join('');
+}
+
 function moveContents(from, to, fromRoot = from, toRoot = to) {
   fs.mkdirSync(to, { recursive: true });
   for (const name of fs.readdirSync(from)) {
@@ -68,9 +86,10 @@ function moveContents(from, to, fromRoot = from, toRoot = to) {
       fs.rmSync(src, { recursive: true, force: true });
     } else if (/^events\.jsonl(\.1)?$/.test(name)) {
       const moved = rewriteEvents(fs.readFileSync(src, 'utf8'), fromRoot, toRoot);
-      // keep older events first so the history stays in order
+      // The old hook can keep writing here until setup re-registers it, so
+      // the two files overlap in time: merge them in time order.
       const existing = fs.existsSync(dest) ? fs.readFileSync(dest, 'utf8') : '';
-      fs.writeFileSync(dest, moved + existing);
+      fs.writeFileSync(dest, mergeByTime(moved, existing));
       fs.unlinkSync(src);
     } else if (!fs.existsSync(dest)) {
       fs.renameSync(src, dest);
@@ -172,4 +191,4 @@ function unregisterHooks() {
   return changed;
 }
 
-module.exports = { settingsPath, defaultLogDir, installedHookPath, migrateLegacy, installHookFile, hookStatus, registerHooks, unregisterHooks };
+module.exports = { mergeByTime, settingsPath, defaultLogDir, installedHookPath, migrateLegacy, installHookFile, hookStatus, registerHooks, unregisterHooks };

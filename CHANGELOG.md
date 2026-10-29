@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.2
+
+- Commands that Claude Code was denied permission for, or that were cancelled, no longer stay "running" forever. Once past their timeout they show as **No result**.
+- Fixed history moved from older versions sometimes being merged out of order, which could leave a finished command shown as running.
+
 ## 0.8.1
 
 - File Changes shows the project name for files at the top of a workspace, instead of the full folder path.

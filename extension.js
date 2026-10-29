@@ -26,6 +26,11 @@ function logDir() {
   return configured || hookSetup.defaultLogDir();
 }
 
+// Claude Code's Bash/PowerShell tool timeouts (ms): default and maximum.
+const DEFAULT_TOOL_TIMEOUT = 2 * 60 * 1000;
+const MAX_TOOL_TIMEOUT = 10 * 60 * 1000;
+const NO_RESULT_GRACE = 60 * 1000;
+
 // Comparable path: forward slashes, no trailing slash, case-insensitive on Windows.
 function normPath(p) {
   if (!p) return '';
@@ -64,6 +69,7 @@ class Store {
   constructor() {
     this.records = new Map();
     this.changes = new Map(); // file edits, keyed by tool_use_id
+    this.earlyEnds = new Map(); // end events seen before their start
     this.offset = 0;
     this.partial = '';
     this._onChange = new vscode.EventEmitter();
@@ -92,9 +98,22 @@ class Store {
 
   // No hook fires when a background task ends, but Claude Code appends
   // "[exited with code N]" to the task's output file.
+  // Nor does one fire when a call is denied or cancelled (Esc), which would
+  // leave it "running" forever; a foreground call can't outlive its timeout,
+  // so past that it is marked "no result".
   checkFinished() {
     let changed = false;
+    const now = Date.now();
     for (const rec of this.records.values()) {
+      if (rec.status === 'running' && !rec.background) {
+        const limit = Math.min(rec.timeout || DEFAULT_TOOL_TIMEOUT, MAX_TOOL_TIMEOUT) + NO_RESULT_GRACE;
+        if (now - rec.startTs > limit) {
+          rec.status = 'noresult';
+          changed = true;
+          this._onRecord.fire({ rec, type: 'end' });
+        }
+        continue;
+      }
       if (rec.status !== 'background') continue;
       if (!rec.outputFile) rec.outputFile = findTaskOutput(rec.session, rec.backgroundTaskId);
       if (!rec.outputFile) continue;
@@ -112,6 +131,7 @@ class Store {
   reset() {
     this.records.clear();
     this.changes.clear();
+    this.earlyEnds.clear();
     this.offset = 0;
     this.partial = '';
     this._onChange.fire();
@@ -168,8 +188,16 @@ class Store {
         edits: ev.edits,
       };
       this.changes.set(ev.id, ch);
+      const early = this.earlyEnds.get('file:' + ev.id);
+      if (early) {
+        this.earlyEnds.delete('file:' + ev.id);
+        return this.applyFile(early);
+      }
     } else {
-      if (!ch) return;
+      if (!ch) {
+        if (ev.id) this.earlyEnds.set('file:' + ev.id, ev); // see apply()
+        return;
+      }
       ch.endTs = ev.ts;
       ch.after = ev.after;
       ch.tooLarge = ch.tooLarge || ev.tooLarge;
@@ -200,13 +228,24 @@ class Store {
         description: ev.description || '',
         cwd: ev.cwd,
         background: ev.background,
+        timeout: ev.timeout,
         startTs: ev.ts,
         status: 'running',
         output: '',
       };
       this.records.set(id, rec);
+      const early = this.earlyEnds.get(id);
+      if (early) {
+        this.earlyEnds.delete(id);
+        return this.apply(early);
+      }
     } else if (ev.type === 'end') {
-      if (!rec) return; // end without start (e.g. history cleared mid-run)
+      if (!rec) {
+        // An end can be logged before its start (history merged out of order);
+        // hold it until the start arrives. Ends whose start was cleared stay here.
+        if (ev.id) this.earlyEnds.set(ev.id, ev);
+        return;
+      }
       rec.endTs = ev.durationMs != null ? rec.startTs + ev.durationMs : ev.ts;
       rec.stdout = ev.stdout || '';
       rec.stderr = ev.stderr || ev.error || '';
@@ -650,6 +689,7 @@ const STATUS_ICON = {
   ok: new vscode.ThemeIcon('pass', new vscode.ThemeColor('testing.iconPassed')),
   failed: new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed')),
   interrupted: new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('charts.orange')),
+  noresult: new vscode.ThemeIcon('question', new vscode.ThemeColor('disabledForeground')),
   stopped: new vscode.ThemeIcon('debug-stop', new vscode.ThemeColor('disabledForeground')),
 };
 
@@ -726,6 +766,8 @@ function footer(rec) {
       return crlf(`\n${c.yellow(`⊘ interrupted after ${dur}`)}\n`);
     case 'stopped':
       return crlf(`\n${c.yellow('■ stopped')}\n`);
+    case 'noresult':
+      return crlf(`\n${c.yellow('… no result: the command was denied, cancelled or interrupted')}\n`);
     default:
       return '';
   }

@@ -337,6 +337,7 @@ main { flex: 1; display: grid; grid-template-columns: minmax(280px, 38%) 1fr; mi
 .s-ok .dot { background: var(--ok); }
 .s-failed .dot { background: var(--bad); }
 .s-interrupted .dot { background: var(--warn); }
+.s-noresult .dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
 .s-stopped .dot { background: var(--muted); opacity: .6; }
 .s-running .dot { background: var(--run); animation: pulse 1.2s ease-in-out infinite; }
 .s-background .dot { background: var(--bgtask); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bgtask) 25%, transparent); }
@@ -354,7 +355,7 @@ main { flex: 1; display: grid; grid-template-columns: minmax(280px, 38%) 1fr; mi
 .d-title h2 { margin: 0; font-size: 14px; font-weight: 600; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; border: 1px solid currentColor; }
 .b-ok { color: var(--ok); } .b-failed { color: var(--bad); } .b-running { color: var(--run); }
-.b-background { color: var(--bgtask); } .b-interrupted { color: var(--warn); } .b-stopped { color: var(--muted); }
+.b-background { color: var(--bgtask); } .b-interrupted { color: var(--warn); } .b-stopped { color: var(--muted); } .b-noresult { color: var(--muted); }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 16px; font-size: 12px; }
 .facts div span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 1px; }
@@ -406,7 +407,7 @@ const save = () => vscode.setState({ selected, filter, project, follow, tab, sel
 const changeKind = (c) => (c.status === 'failed' ? 'failed' : c.created ? 'created' : 'edited');
 const CHANGE_LABEL = { edited: 'Edited', created: 'Created', failed: 'Failed', pending: 'Saving…' };
 
-const STATUS_LABEL = { running: 'Running', background: 'Background', ok: 'Done', failed: 'Failed', interrupted: 'Interrupted', stopped: 'Stopped' };
+const STATUS_LABEL = { running: 'Running', background: 'Background', ok: 'Done', failed: 'Failed', interrupted: 'Interrupted', stopped: 'Stopped', noresult: 'No result' };
 const isActive = (r) => r.status === 'running' || r.status === 'background';
 
 function dur(ms) {
@@ -690,7 +691,8 @@ function renderOutput() {
   if (!html) {
     html = '<span class="placeholder">' + (r.status === 'running'
       ? 'Running… output appears when the command finishes.'
-      : r.status === 'background' ? 'Waiting for output…' : 'No output.') + '</span>';
+      : r.status === 'background' ? 'Waiting for output…'
+      : r.status === 'noresult' ? 'No result: the command was denied, cancelled or interrupted before it finished.' : 'No output.') + '</span>';
   }
   el.innerHTML = html;
   scrollOut();
