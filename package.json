@@ -2,7 +2,7 @@
   "name": "command-center-for-claude-code",
   "displayName": "Command Center for Claude Code",
   "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, sessions you can resume or move between projects, notifications, token usage, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "publisher": "hynexia",
   "author": {
     "name": "Hynexia",

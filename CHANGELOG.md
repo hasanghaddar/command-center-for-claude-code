@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 - **File changes made by shell commands**: in a git repository, files Claude changes through Bash or PowerShell (`sed`, a Python script, a code generator, `git checkout`) now appear in File Changes with the command that made them, and can be diffed, included in session diffs and reverted. Deleted files are shown too. Background commands and git-ignored files aren't tracked.
 - Tested on macOS: hook, Stop for background tasks, dev-server URLs, sessions, transcripts and Move Session.
