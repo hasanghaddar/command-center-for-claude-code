@@ -2,3 +2,4 @@
 *.vsix
 .gitattributes
 media/screenshot-*.png
+.env

@@ -923,11 +923,10 @@ class TerminalManager {
       if (!store.inScope(rec)) return;
       if (type === 'url') return announceUrl(store, rec);
       if (this.feed) this.feed.event(rec, type);
-      if (
-        type === 'end' &&
-        rec.status === 'background' &&
-        vscode.workspace.getConfiguration('claudeCommandCenter').get('autoOpenBackground')
-      ) {
+      const config = vscode.workspace.getConfiguration('claudeCommandCenter');
+      if (type === 'start' && !rec.background && config.get('autoOpenForeground')) {
+        this.open(rec);
+      } else if (type === 'end' && rec.status === 'background' && config.get('autoOpenBackground')) {
         this.open(rec);
       }
     });
