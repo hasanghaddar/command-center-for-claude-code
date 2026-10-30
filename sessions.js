@@ -103,7 +103,9 @@ function applyLine(e, line, keepUsageSince) {
     if (ts > e.lastTs) e.lastTs = ts;
     e.lastTsSeen = ts;
   }
-  if (o.cwd) e.cwd = o.cwd;
+  // The first cwd is the folder the session was started in; later ones
+  // follow Claude's `cd`s into subfolders.
+  if (o.cwd && !e.cwd) e.cwd = o.cwd;
   if (o.entrypoint) e.entrypoint = o.entrypoint;
   switch (o.type) {
     case 'ai-title':
@@ -270,7 +272,7 @@ class SessionIndex {
         id: e.id,
         file: e.file,
         projectDir: e.projectDir,
-        cwd: e.cwd,
+        cwd: (live && live.cwd) || e.cwd,
         title: e.customTitle || e.title,
         lastPrompt: e.lastPrompt,
         firstTs: e.firstTs,

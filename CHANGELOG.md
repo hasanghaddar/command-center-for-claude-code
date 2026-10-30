@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1
+
+- **Open Session** from a notification or the Sessions view no longer asks to "resume anyway" for a session that is open in the Claude Code panel of this window. A session's project is now the folder it was started in, not the last folder Claude `cd`'d into, which also fixes the project shown in the Sessions list.
+
 ## 0.11.0
 
 - **Regular commands open a terminal tab** when Claude starts them, not only background processes. The tab shows the command right away and its output when it finishes. Turn this off with `claudeCommandCenter.autoOpenForeground`.
