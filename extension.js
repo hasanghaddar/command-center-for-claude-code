@@ -925,20 +925,32 @@ class TerminalManager {
       if (this.feed) this.feed.event(rec, type);
       const config = vscode.workspace.getConfiguration('claudeCommandCenter');
       if (type === 'start' && !rec.background && config.get('autoOpenForeground')) {
-        this.open(rec);
+        this.closeFinished();
+        this.open(rec, true);
       } else if (type === 'end' && rec.status === 'background' && config.get('autoOpenBackground')) {
-        this.open(rec);
+        this.open(rec, true);
       }
     });
   }
 
-  open(rec) {
+  // auto: opened because Claude ran it, not by the user; such tabs of
+  // finished commands are closed when the next command opens.
+  open(rec, auto = false) {
     let t = this.terminals.get(rec.id);
     if (!t) {
       t = new RecordTerminal(this, rec);
       this.terminals.set(rec.id, t);
     }
+    t.auto = auto && t.auto !== false;
     t.show();
+  }
+
+  // Close auto-opened tabs of foreground commands that have finished; they
+  // can be reopened from the dashboard or the Commands view.
+  closeFinished() {
+    for (const t of [...this.terminals.values()]) {
+      if (t.auto && !t.rec.background && t.rec.status !== 'running') t.dispose();
+    }
   }
 
   openFeed() {

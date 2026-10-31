@@ -106,7 +106,7 @@ How long it is kept:
 |---|---|---|
 | `claudeCommandCenter.scope` | `workspace` | Show only this window's projects, or `all`. |
 | `claudeCommandCenter.autoOpenBackground` | `true` | Open a live log tab when Claude starts a background process. |
-| `claudeCommandCenter.autoOpenForeground` | `true` | Open a tab when Claude starts a regular command. Output appears when it finishes. |
+| `claudeCommandCenter.autoOpenForeground` | `true` | Open a tab when Claude starts a regular command. Output appears when it finishes, and the tab closes when the next command opens. |
 | `claudeCommandCenter.retentionDays` | `7` | Days to keep edit snapshots. `0` keeps them forever. |
 | `claudeCommandCenter.chatFileRetentionHours` | `24` | Hours to keep files made for chat mentions. `0` keeps them forever. |
 | `claudeCommandCenter.maxItems` | `200` | Most items shown per list. |

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.2
+
+- **Finished command tabs close themselves**: when Claude starts a new command, the tabs of earlier finished commands that opened automatically are closed, so only the latest stays. Reopen any of them from the dashboard or the Commands view. Tabs you opened yourself and background-process logs are left open.
+
 ## 0.11.1
 
 - **Open Session** from a notification or the Sessions view no longer asks to "resume anyway" for a session that is open in the Claude Code panel of this window. A session's project is now the folder it was started in, not the last folder Claude `cd`'d into, which also fixes the project shown in the Sessions list.
