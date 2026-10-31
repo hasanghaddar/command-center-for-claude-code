@@ -1102,7 +1102,8 @@ class TerminalManager {
   // can be reopened from the dashboard or the Commands view.
   closeFinished() {
     for (const t of [...this.terminals.values()]) {
-      if (t.auto && !t.rec.background && t.rec.status !== 'running') t.dispose();
+      // A command moved to the background mid-run is still going; keep it.
+      if (t.auto && !t.rec.background && t.rec.status !== 'running' && t.rec.status !== 'background') t.dispose();
     }
   }
 

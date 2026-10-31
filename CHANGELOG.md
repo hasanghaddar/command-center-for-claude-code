@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.1
+
+- A command Claude moves to the background while it runs (a long build or deploy) keeps its tab open; only finished commands' tabs close when the next command starts.
+
 ## 0.12.0
 
 - **Live output for every command**: a command's tab now streams its output while it runs, not only when it finishes. Claude Code writes the output to a file as it goes, and the tab reads from it.
