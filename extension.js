@@ -9,7 +9,7 @@ const cp = require('child_process');
 const { Dashboard, folderLabel } = require('./dashboard');
 const hookSetup = require('./hook-setup');
 const sessions = require('./sessions');
-const { findTaskPids, killTree } = require('./processes');
+const { findTaskPids, killTree, listProcesses, matchTaskProcesses, processTree } = require('./processes');
 const { TranscriptViews } = require('./transcript-view');
 const { searchTranscripts } = require('./transcript');
 
@@ -65,6 +65,17 @@ function formatDuration(ms) {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m ${Math.round(s % 60)}s`;
   return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function formatBytes(n) {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  return `${Math.round(n / 1024 ** 2)} MB`;
+}
+
+// "12% · 1.3 GB" for a command's latest resource sample.
+function formatUsage(u) {
+  if (!u) return '';
+  return [u.cpu != null ? `${Math.round(u.cpu)}%` : null, formatBytes(u.mem)].filter(Boolean).join(' · ');
 }
 
 function formatTime(ts) {
@@ -612,13 +623,16 @@ function writeCommandContext(rec) {
 
 // Claude Code writes background task output to
 // <tmp>/claude/<project>/<session>/tasks/<taskId>.output
-function findTaskOutput(session, taskId) {
-  if (!session || !taskId) return undefined;
+// A session's task folder, where Claude Code writes each command's output
+// while it runs: <root>/<project>/<session>/tasks.
+function findTasksDirs(session) {
+  if (!session) return [];
   // <tmp>/claude on Windows; <tmp>/claude-<uid> on macOS and Linux, where
   // <tmp> is CLAUDE_CODE_TMPDIR, else /tmp (Node's tmpdir() can differ).
   const uid = process.getuid ? process.getuid() : '';
   const tmps = [...new Set([process.env.CLAUDE_CODE_TMPDIR, os.tmpdir(), process.platform === 'win32' ? null : '/tmp'].filter(Boolean))];
   const roots = tmps.flatMap((t) => [path.join(t, 'claude'), path.join(t, `claude-${uid}`)]);
+  const dirs = [];
   for (const root of roots) {
     let projects;
     try {
@@ -627,9 +641,18 @@ function findTaskOutput(session, taskId) {
       continue;
     }
     for (const p of projects) {
-      const candidate = path.join(root, p, session, 'tasks', `${taskId}.output`);
-      if (fs.existsSync(candidate)) return candidate;
+      const dir = path.join(root, p, session, 'tasks');
+      if (fs.existsSync(dir)) dirs.push(dir);
     }
+  }
+  return dirs;
+}
+
+function findTaskOutput(session, taskId) {
+  if (!taskId) return undefined;
+  for (const dir of findTasksDirs(session)) {
+    const candidate = path.join(dir, `${taskId}.output`);
+    if (fs.existsSync(candidate)) return candidate;
   }
   return undefined;
 }
@@ -704,6 +727,10 @@ class Provider {
     clearInterval(this.ticker);
   }
 
+  refresh() {
+    this._onDidChangeTreeData.fire();
+  }
+
   getChildren(el) {
     return el ? [] : this.store.list();
   }
@@ -721,10 +748,17 @@ class Provider {
     if (rec.status === 'running') when = `running ${formatDuration(elapsed)}`;
     else if (rec.status === 'background') when = `${rec.url ? rec.url.replace(/^https?:\/\//, '') : 'background'} · ${formatTime(rec.startTs)}`;
     else when = `${formatDuration(elapsed)} · ${formatTime(rec.startTs)}`;
-    item.description = [project, when].filter(Boolean).join(' · ');
+    // Usage is shown while running, and only if sampled recently.
+    const live = rec.status === 'running' || rec.status === 'background';
+    const usage = live && rec.usage && Date.now() - rec.usage.ts < 90 * 1000 ? formatUsage(rec.usage) : '';
+    item.description = [project, when, usage].filter(Boolean).join(' · ');
 
     const md = new vscode.MarkdownString();
     md.appendMarkdown(`**${rec.status}** · ${rec.tool} · ${formatTime(rec.startTs)}\n\n`);
+    if (usage || rec.peakMem) {
+      const parts = [usage && `CPU and RAM now: ${usage}`, rec.peakMem && `peak ${formatBytes(rec.peakMem)} RAM`].filter(Boolean);
+      md.appendMarkdown(parts.join(' · ') + '\n\n');
+    }
     if (rec.cwd) md.appendMarkdown(`\`${rec.cwd}\`\n\n`);
     md.appendCodeblock(rec.command.length > 2000 ? rec.command.slice(0, 2000) + '…' : rec.command, rec.tool === 'PowerShell' ? 'powershell' : 'bash');
     item.tooltip = md;
@@ -752,13 +786,14 @@ function header(rec) {
 
 function footer(rec) {
   const dur = rec.endTs ? formatDuration(rec.endTs - rec.startTs) : '';
+  const peak = rec.peakMem ? c.dim(` · peak ${formatBytes(rec.peakMem)} RAM`) : '';
   switch (rec.status) {
     case 'ok':
-      return crlf(`\n${c.green(`✔ finished in ${dur}`)}\n`);
+      return crlf(`\n${c.green(`✔ finished in ${dur}`)}${peak}\n`);
     case 'failed':
-      return crlf(`\n${c.red(`✖ failed${rec.exitCode != null ? ` (exit ${rec.exitCode})` : ''} after ${dur}`)}\n`);
+      return crlf(`\n${c.red(`✖ failed${rec.exitCode != null ? ` (exit ${rec.exitCode})` : ''} after ${dur}`)}${peak}\n`);
     case 'interrupted':
-      return crlf(`\n${c.yellow(`⊘ interrupted after ${dur}`)}\n`);
+      return crlf(`\n${c.yellow(`⊘ interrupted after ${dur}`)}${peak}\n`);
     case 'stopped':
       return crlf(`\n${c.yellow('■ stopped')}\n`);
     case 'noresult':
@@ -780,16 +815,19 @@ class RecordTerminal {
     this.manager = manager;
     this.rec = rec;
     this.writeEmitter = new vscode.EventEmitter();
+    this.nameEmitter = new vscode.EventEmitter();
     this.tailOffset = 0;
     this.wroteResult = false;
     const pty = {
       onDidWrite: this.writeEmitter.event,
+      onDidChangeName: this.nameEmitter.event,
       open: () => this.render(),
       close: () => this.dispose(true),
       handleInput: () => {},
     };
+    this.name = `Claude: ${(rec.description || rec.command.split(/\r?\n/)[0]).slice(0, 40)}`;
     this.terminal = vscode.window.createTerminal({
-      name: `Claude: ${(rec.description || rec.command.split(/\r?\n/)[0]).slice(0, 40)}`,
+      name: this.name,
       pty,
       iconPath: new vscode.ThemeIcon(rec.background ? 'radio-tower' : 'terminal'),
       isTransient: true,
@@ -807,17 +845,21 @@ class RecordTerminal {
 
   update() {
     const rec = this.rec;
+    this.showUsage();
     if (rec.status === 'running') {
       if (!this.wroteRunning) {
-        this.write(c.dim(crlf('… running (output appears when the command finishes)\n')));
+        this.write(c.dim(crlf('… running\n')));
         this.wroteRunning = true;
       }
+      this.startLive();
       return;
     }
     if (!this.wroteResult) {
       this.wroteResult = true;
       if (rec.background) {
         if (rec.stdout && !rec.outputFile) this.write(resultText(rec));
+      } else if (this.stopLive()) {
+        this.write(this.liveRemainder());
       } else {
         this.write(resultText(rec));
       }
@@ -864,12 +906,85 @@ class RecordTerminal {
     this.tailTimer = setInterval(tick, 400);
   }
 
+  // Stream a running command's output from the file Claude Code writes it to.
+  // The file isn't named after anything we know at start, so it is the
+  // unclaimed one created closest after the command started.
+  startLive() {
+    if (this.liveTimer || this.rec.background) return;
+    const tick = (this.liveTick = () => {
+      if (!this.liveFile) {
+        this.liveFile = this.manager.claimLiveOutput(this.rec);
+        if (!this.liveFile) return;
+        this.liveOffset = 0;
+        this.liveText = '';
+        this.liveDecoder = new (require('string_decoder').StringDecoder)('utf8');
+      }
+      let size;
+      try {
+        size = fs.statSync(this.liveFile).size;
+      } catch {
+        return; // removed once the command finished
+      }
+      if (size <= this.liveOffset) return;
+      const len = Math.min(size - this.liveOffset, 1024 * 1024);
+      const buf = Buffer.alloc(len);
+      const fd = fs.openSync(this.liveFile, 'r');
+      try {
+        fs.readSync(fd, buf, 0, len, this.liveOffset);
+      } finally {
+        fs.closeSync(fd);
+      }
+      this.liveOffset += len;
+      const s = this.liveDecoder.write(buf);
+      this.liveText += s;
+      this.write(crlf(s));
+    });
+    tick();
+    this.liveTimer = setInterval(tick, 400);
+  }
+
+  // Stop streaming; true if any output was streamed.
+  stopLive() {
+    if (!this.liveTimer) return false;
+    clearInterval(this.liveTimer);
+    this.liveTimer = null;
+    if (this.liveTick) this.liveTick();
+    return !!this.liveText;
+  }
+
+  // CPU and memory in the tab title while the command runs.
+  showUsage() {
+    const running = this.rec.status === 'running' || this.rec.status === 'background';
+    const text = running ? formatUsage(this.rec.usage) : '';
+    const name = text ? `${this.name} · ${text}` : this.name;
+    if (name !== this.shownName) this.nameEmitter.fire((this.shownName = name));
+  }
+
+  // What the result has beyond the streamed output (its tail, if the file
+  // was removed before the last read), plus stderr.
+  // If the result doesn't match what was streamed (another command's file
+  // was picked up), the result is printed in full.
+  liveRemainder() {
+    const rec = this.rec;
+    const lf = (s) => s.replace(/\r\n/g, '\n');
+    const live = lf(this.liveText);
+    const stdout = lf(rec.stdout || '');
+    const n = Math.min(200, live.trim().length, stdout.trim().length);
+    if (n && live.trimStart().slice(0, n) !== stdout.trimStart().slice(0, n)) return crlf(c.dim('\n— result —\n')) + resultText(rec);
+    let out = '';
+    if (stdout.length > live.length && stdout.startsWith(live)) out += stdout.slice(live.length);
+    if (!(out || live).endsWith('\n')) out += '\n';
+    if (rec.stderr && !this.liveText.includes(rec.stderr)) out += c.red(rec.stderr) + (rec.stderr.endsWith('\n') ? '' : '\n');
+    return crlf(out);
+  }
+
   show() {
     this.terminal.show(true);
   }
 
   dispose(fromClose) {
     clearInterval(this.tailTimer);
+    clearInterval(this.liveTimer);
     this.manager.terminals.delete(this.rec.id);
     if (!fromClose) this.terminal.dispose();
   }
@@ -916,8 +1031,10 @@ class TerminalManager {
   constructor(store) {
     this.store = store;
     this.terminals = new Map();
+    this.liveClaims = new Set(); // output files of running foreground commands
     this.feed = null;
     store.onRecord(({ rec, type }) => {
+      if (rec.liveFile && rec.status !== 'running') this.liveClaims.delete(rec.liveFile);
       const t = this.terminals.get(rec.id);
       if (t) t.update();
       if (!store.inScope(rec)) return;
@@ -945,6 +1062,42 @@ class TerminalManager {
     t.show();
   }
 
+  // The output file of a running foreground command: the unclaimed one in its
+  // session's task folder created closest after it started. Files of known
+  // background tasks are skipped. Kept on the record until it finishes.
+  claimLiveOutput(rec) {
+    if (rec.liveFile) return rec.liveFile;
+    const taken = new Set(this.liveClaims);
+    for (const r of this.store.records.values()) {
+      if (r.backgroundTaskId && r.session === rec.session) taken.add(`${r.backgroundTaskId}.output`);
+    }
+    let best = null;
+    for (const dir of findTasksDirs(rec.session)) {
+      let names;
+      try {
+        names = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const n of names) {
+        const f = path.join(dir, n);
+        if (!n.endsWith('.output') || taken.has(n) || taken.has(f)) continue;
+        let st;
+        try {
+          st = fs.statSync(f);
+        } catch {
+          continue;
+        }
+        const born = st.birthtimeMs || st.ctimeMs;
+        if (born < rec.startTs - 1000) continue;
+        if (!best || born < best.born) best = { f, born };
+      }
+    }
+    if (!best) return null;
+    this.liveClaims.add(best.f);
+    return (rec.liveFile = best.f);
+  }
+
   // Close auto-opened tabs of foreground commands that have finished; they
   // can be reopened from the dashboard or the Commands view.
   closeFinished() {
@@ -960,6 +1113,111 @@ class TerminalManager {
 
   dispose() {
     for (const t of this.terminals.values()) clearInterval(t.tailTimer);
+  }
+}
+
+// CPU and memory of the commands Claude is running, summed over each
+// command's process tree. A sample isn't free (on Windows it starts
+// PowerShell: about 0.6 s of CPU), so samples are only taken while this window
+// is focused and someone can see them (the Commands view, or the command's tab
+// as the active terminal), never more often than every few seconds, and less
+// often when samples are slow or the commands are long-running.
+class ResourceMonitor {
+  constructor(store, terminals, view, provider) {
+    this.store = store;
+    this.terminals = terminals;
+    this.view = view;
+    this.provider = provider;
+    this.cores = os.cpus().length || 1;
+    this.base = process.platform === 'win32' ? 10 * 1000 : 3 * 1000;
+    this.prev = new Map(); // rec.id -> { ts, times: Map(pid -> cpuMs) }, Windows only
+    this.nextSample = 0;
+    this.timer = setInterval(() => this.tick(), 2000); // checks only; no process is started
+  }
+
+  dispose() {
+    clearInterval(this.timer);
+  }
+
+  targets() {
+    if (!vscode.workspace.getConfiguration('claudeCommandCenter').get('resourceUsage')) return [];
+    if (!vscode.window.state.focused) return [];
+    const active = vscode.window.activeTerminal;
+    return [...this.store.records.values()].filter((rec) => {
+      if (rec.status !== 'running' && rec.status !== 'background') return false;
+      if (!this.store.inScope(rec)) return false;
+      if (this.view.visible) return true;
+      const t = this.terminals.terminals.get(rec.id);
+      return !!t && t.terminal === active;
+    });
+  }
+
+  async tick() {
+    if (this.busy) return;
+    const targets = this.targets();
+    for (const id of this.prev.keys()) if (!targets.some((r) => r.id === id)) this.prev.delete(id);
+    if (!targets.length || Date.now() < this.nextSample) return;
+    this.busy = true;
+    const ts = Date.now();
+    let procs = [];
+    try {
+      procs = await listProcesses();
+    } finally {
+      this.busy = false;
+    }
+    const took = Date.now() - ts;
+    // Long-running commands (dev servers) change slowly; a slow sample means a
+    // busy machine. Either way, sample less often.
+    const longRunning = targets.every((r) => ts - r.startTs > 2 * 60 * 1000);
+    const delay = Math.max(longRunning ? this.base * 3 : this.base, took * 10);
+    this.nextSample = Date.now() + Math.min(delay, 60 * 1000);
+    if (!procs.length) return;
+    this.measure(targets, procs, ts);
+    this.provider.refresh();
+    for (const rec of targets) {
+      const t = this.terminals.terminals.get(rec.id);
+      if (t) t.showUsage();
+    }
+  }
+
+  measure(targets, procs, ts) {
+    const byPid = new Map(procs.map((p) => [p.pid, p]));
+    for (const rec of targets) {
+      let taskId = rec.backgroundTaskId;
+      if (!taskId && rec.status === 'running' && this.terminals.claimLiveOutput(rec)) taskId = path.basename(rec.liveFile, '.output');
+      const roots = matchTaskProcesses(procs, { command: rec.command, backgroundTaskId: taskId });
+      if (!roots.length) {
+        rec.usage = null;
+        continue;
+      }
+      let mem = 0;
+      let pcpu = 0;
+      const times = new Map();
+      for (const pid of processTree(procs, roots)) {
+        const p = byPid.get(pid);
+        if (!p) continue;
+        mem += p.mem || 0;
+        if (p.cpuMs != null) times.set(pid, p.cpuMs);
+        pcpu += p.pcpu || 0;
+      }
+      // Percent of the whole machine, as Task Manager shows it. Windows gives
+      // CPU time, so it takes two samples; processes new since the last one
+      // count all their time.
+      let cpu = null;
+      if (process.platform !== 'win32') {
+        cpu = pcpu / this.cores;
+      } else {
+        const prev = this.prev.get(rec.id);
+        if (prev) {
+          let used = 0;
+          for (const [pid, t] of times) used += Math.max(0, t - (prev.times.get(pid) || 0));
+          cpu = Math.min(100, (used / ((ts - prev.ts) * this.cores)) * 100);
+        }
+        this.prev.set(rec.id, { ts, times });
+      }
+      rec.usage = { cpu, mem, ts };
+      rec.peakMem = Math.max(rec.peakMem || 0, mem);
+    }
   }
 }
 
@@ -1692,6 +1950,8 @@ function activate(context) {
   const terminals = new TerminalManager(store);
 
   const view = vscode.window.createTreeView('claudeCommandCenter.commands', { treeDataProvider: provider });
+  const monitor = new ResourceMonitor(store, terminals, view, provider);
+  context.subscriptions.push(monitor);
   const changesView = vscode.window.createTreeView('claudeCommandCenter.changes', { treeDataProvider: new ChangesProvider(store) });
   pruneOldFiles();
   const pruneTimer = setInterval(pruneOldFiles, 60 * 60 * 1000); // windows stay open for days

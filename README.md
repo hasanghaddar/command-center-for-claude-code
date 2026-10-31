@@ -23,7 +23,9 @@ One place in VS Code to watch, control and feed context to Claude Code:
 **Commands**
 - A **Command Center** sidebar and a full **dashboard** tab listing every Bash and PowerShell command Claude runs: status, folder, duration, exit code and colored output.
 - Click the **Running**, **Background** or **Failed** counts to filter. Search with `/`, move with ↑/↓.
+- **Live output**: each command Claude runs opens a tab that streams its output as it runs. When the next command starts, tabs of finished ones close (reopen them from the list).
 - **Background processes** (dev servers, watchers) stream their output live, open a log tab automatically, and switch to done or failed when they exit.
+- **CPU and memory** of running commands, summed over everything they started, in the list and the tab title, with peak memory when they finish. Measured only while the window is focused and you're looking (the Commands view or the command's tab), every 10 seconds on Windows and 3 on macOS and Linux, and less often for long-running processes or on a busy machine. Turn off with `claudeCommandCenter.resourceUsage`.
 - **Stop** a background process. It finds the exact process Claude started and stops its whole process tree, after asking you.
 - **Dev servers**: when a background process prints a local address (`http://localhost:5173`), you're offered **Open in Browser** or **Open in VS Code**. The address also shows in the list.
 - **Run again in my terminal** pastes the command into a real terminal without running it. **Live feed** prints every command as it happens.
@@ -106,7 +108,8 @@ How long it is kept:
 |---|---|---|
 | `claudeCommandCenter.scope` | `workspace` | Show only this window's projects, or `all`. |
 | `claudeCommandCenter.autoOpenBackground` | `true` | Open a live log tab when Claude starts a background process. |
-| `claudeCommandCenter.autoOpenForeground` | `true` | Open a tab when Claude starts a regular command. Output appears when it finishes, and the tab closes when the next command opens. |
+| `claudeCommandCenter.autoOpenForeground` | `true` | Open a tab when Claude starts a regular command. Output streams live, and the tab closes when the next command opens. |
+| `claudeCommandCenter.resourceUsage` | `true` | Show CPU and memory of running commands. Only measured while you're looking. |
 | `claudeCommandCenter.retentionDays` | `7` | Days to keep edit snapshots. `0` keeps them forever. |
 | `claudeCommandCenter.chatFileRetentionHours` | `24` | Hours to keep files made for chat mentions. `0` keeps them forever. |
 | `claudeCommandCenter.maxItems` | `200` | Most items shown per list. |
@@ -123,7 +126,8 @@ How long it is kept:
 
 ## Known limitations
 
-- **Foreground output appears when a command finishes**, not while it runs. Claude Code's hooks don't expose output mid-run.
+- **Live foreground output** is read from the file Claude Code writes it to, matched to the command by when it started. If Claude runs several commands at the same moment, a tab can show another one's output while they run; the real result is printed below it when the command ends.
+- **CPU and memory** are what the command's own processes use on this machine (work it hands to Docker or a remote service isn't counted). Peak memory is the highest seen while it was being measured. On Linux, CPU is each process's average since it started rather than right now.
 - **Tested on Windows and macOS.** Linux is supported but not yet verified, Stop in particular: it may not find the process there.
 - **Files changed by shell commands** are only tracked inside a git repository (git-ignored files, such as build output, aren't), and not for background commands, which change files after their hook has run. Changes made by anything else while a command runs, such as another Claude session or a background dev server, are counted as that command's.
 - **Usage is tokens, not a quota percentage.** Your plan's 5-hour and weekly limits aren't stored locally, so the extension can't show how close you are to them.

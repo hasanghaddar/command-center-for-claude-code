@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.0
+
+- **Live output for every command**: a command's tab now streams its output while it runs, not only when it finishes. Claude Code writes the output to a file as it goes, and the tab reads from it.
+- **CPU and memory** of running commands, summed over everything each one started: in the Commands view, in the tab title (`· 12% · 1.3 GB`), and peak memory in the footer when it finishes. Measured only while the window is focused and the Commands view or the command's tab is showing, every 10 seconds on Windows (3 on macOS and Linux), less often for long-running processes or when the machine is busy. Turn off with `claudeCommandCenter.resourceUsage`.
+
 ## 0.11.2
 
 - **Finished command tabs close themselves**: when Claude starts a new command, the tabs of earlier finished commands that opened automatically are closed, so only the latest stays. Reopen any of them from the dashboard or the Commands view. Tabs you opened yourself and background-process logs are left open.

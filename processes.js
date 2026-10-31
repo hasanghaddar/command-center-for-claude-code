@@ -1,4 +1,4 @@
-// Finding and stopping the OS processes behind a Claude Code background task.
+// Finding, measuring and stopping the OS processes behind a Claude Code command.
 // Plain Node (no vscode import) so it can be tested on its own.
 
 const cp = require('child_process');
@@ -38,32 +38,60 @@ function matchTaskProcesses(procs, rec, selfPid = process.pid) {
   return matching.filter((p) => !ids.has(p.ppid)).map((p) => p.pid);
 }
 
+// [{ pid, ppid, cmd, mem, cpuMs | pcpu }]: mem is resident bytes; Windows
+// gives total CPU time (cpuMs), macOS and Linux a CPU percentage (pcpu, of
+// one core).
 function listProcesses() {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') {
-      cp.execFile('ps', ['-eo', 'pid=,ppid=,args='], { maxBuffer: 32 * 1024 * 1024 }, (err, out) => {
+      cp.execFile('ps', ['-eo', 'pid=,ppid=,rss=,pcpu=,args='], { maxBuffer: 32 * 1024 * 1024 }, (err, out) => {
         if (err) return resolve([]);
         resolve(
           out.split('\n').map((l) => {
-            const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l);
-            return m ? { pid: +m[1], ppid: +m[2], cmd: m[3] } : null;
+            const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(.*)$/.exec(l);
+            return m ? { pid: +m[1], ppid: +m[2], mem: +m[3] * 1024, pcpu: +m[4], cmd: m[5] } : null;
           }).filter(Boolean)
         );
       });
       return;
     }
+    // Processes without a command line (system ones) are kept for their parent
+    // links and usage only.
     const ps =
-      'Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.ProcessId -ne $PID } | ' +
-      'Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress';
+      'Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CommandLine,WorkingSetSize,KernelModeTime,UserModeTime | ' +
+      'Where-Object { $_.ProcessId -ne $PID } | ' +
+      'Select-Object ProcessId,ParentProcessId,CommandLine,WorkingSetSize,KernelModeTime,UserModeTime | ConvertTo-Json -Compress';
     cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
       if (err) return resolve([]);
       try {
-        resolve([].concat(JSON.parse(out)).map((p) => ({ pid: p.ProcessId, ppid: p.ParentProcessId, cmd: p.CommandLine })));
+        resolve(
+          [].concat(JSON.parse(out)).map((p) => ({
+            pid: p.ProcessId,
+            ppid: p.ParentProcessId,
+            cmd: p.CommandLine || '',
+            mem: p.WorkingSetSize || 0,
+            cpuMs: ((p.KernelModeTime || 0) + (p.UserModeTime || 0)) / 10000, // 100 ns units
+          }))
+        );
       } catch {
         resolve([]);
       }
     });
   });
+}
+
+// The pids of these processes and everything they started.
+function processTree(procs, rootPids) {
+  const tree = [...rootPids];
+  const children = new Map();
+  for (const p of procs) {
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(p.pid);
+  }
+  for (let i = 0; i < tree.length; i++) {
+    for (const c of children.get(tree[i]) || []) if (!tree.includes(c)) tree.push(c);
+  }
+  return tree;
 }
 
 async function findTaskPids(rec) {
@@ -77,11 +105,7 @@ async function killTree(pid) {
   if (process.platform === 'win32') {
     return new Promise((resolve) => cp.execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve()));
   }
-  const procs = await listProcesses();
-  const tree = [pid];
-  for (let i = 0; i < tree.length; i++) {
-    for (const p of procs) if (p.ppid === tree[i] && !tree.includes(p.pid)) tree.push(p.pid);
-  }
+  const tree = processTree(await listProcesses(), [pid]);
   try {
     process.kill(-pid, 'SIGTERM'); // the whole group, when it is one
   } catch {}
@@ -92,4 +116,4 @@ async function killTree(pid) {
   }
 }
 
-module.exports = { findTaskPids, killTree, matchTaskProcesses, redirectsToTask, wrappedCommand, listProcesses };
+module.exports = { findTaskPids, killTree, matchTaskProcesses, redirectsToTask, wrappedCommand, listProcesses, processTree };

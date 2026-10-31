@@ -2,7 +2,7 @@
   "name": "command-center-for-claude-code",
   "displayName": "Command Center for Claude Code",
   "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, sessions you can resume or move between projects, notifications, token usage, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
-  "version": "0.11.2",
+  "version": "0.12.0",
   "publisher": "hynexia",
   "author": {
     "name": "Hynexia",
@@ -682,7 +682,12 @@
         "claudeCommandCenter.autoOpenForeground": {
           "type": "boolean",
           "default": true,
-          "description": "Open a terminal tab whenever Claude starts a regular (foreground) command. Its output appears when the command finishes. Tabs of finished commands close when the next one opens; reopen them from the dashboard or Commands view."
+          "description": "Open a terminal tab whenever Claude starts a regular (foreground) command. Its output streams live. Tabs of finished commands close when the next one opens; reopen them from the dashboard or Commands view."
+        },
+        "claudeCommandCenter.resourceUsage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the CPU and memory of commands Claude is running. Measured only while this window is focused and the Commands view or the command's tab is showing, every 10 seconds or less often on Windows (each reading costs about half a second of CPU there) and every 3 seconds on macOS and Linux."
         },
         "claudeCommandCenter.scope": {
           "type": "string",
