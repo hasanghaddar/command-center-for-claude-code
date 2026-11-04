@@ -591,12 +591,25 @@ async function addTerminalTextToChat(copyCommand, what) {
   await addToClaudeChat([{ uri: vscode.Uri.file(file) }]);
 }
 
+// A leading `cd <dir>;` / `cd <dir> &&` (or Set-Location / pushd) that only
+// moves into the project folder before the real command.
+const LEADING_CD = /^\s*(?:cd|chdir|pushd|Set-Location|sl)(?:\s+\/d)?(?:\s+-(?:Path|LiteralPath))?\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s*(?:;|&&|\r?\n)\s*/i;
+
+// What to call a command in lists and tab names: its description, or else its
+// first line without the `cd` into the project folder.
+function commandLabel(rec) {
+  if (rec.description) return rec.description;
+  let cmd = rec.command || '';
+  for (let m; (m = LEADING_CD.exec(cmd)) && m[0].length < cmd.length; ) cmd = cmd.slice(m[0].length);
+  return cmd.split(/\r?\n/)[0];
+}
+
 // Commands have no file of their own, so save one with the command and its
 // output and mention that.
 function writeCommandContext(rec) {
   const dir = path.join(logDir(), 'context');
   fs.mkdirSync(dir, { recursive: true });
-  const safe = (rec.description || rec.command.split(/\r?\n/)[0]).replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50) || 'command';
+  const safe = commandLabel(rec).replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50) || 'command';
   const file = path.join(dir, `${safe}-${rec.startTs}.log`);
   let output = rec.stdout || '';
   if (rec.background && rec.outputFile) {
@@ -736,8 +749,7 @@ class Provider {
   }
 
   getTreeItem(rec) {
-    const firstLine = rec.command.split(/\r?\n/)[0];
-    const label = rec.description || firstLine;
+    const label = commandLabel(rec);
     const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
     item.id = rec.id;
     item.iconPath = STATUS_ICON[rec.status] || STATUS_ICON.ok;
@@ -825,7 +837,7 @@ class RecordTerminal {
       close: () => this.dispose(true),
       handleInput: () => {},
     };
-    this.name = `Claude: ${(rec.description || rec.command.split(/\r?\n/)[0]).slice(0, 40)}`;
+    this.name = `Claude: ${commandLabel(rec).slice(0, 40)}`;
     this.terminal = vscode.window.createTerminal({
       name: this.name,
       pty,
@@ -1016,7 +1028,7 @@ class FeedTerminal {
     if (type === 'start') {
       this.writeEmitter.fire(c.dim(crlf(`[${formatTime(rec.startTs)}] `)) + header(rec).replace(/^.*?\r\n/, ''));
     } else if (type === 'end' || type === 'stopped') {
-      const label = c.dim(`[${formatTime(rec.endTs || Date.now())}] ← ${rec.description || rec.command.split(/\r?\n/)[0]}`);
+      const label = c.dim(`[${formatTime(rec.endTs || Date.now())}] ← ${commandLabel(rec)}`);
       this.writeEmitter.fire(crlf(label + '\n'));
       if (rec.status === 'background') {
         this.writeEmitter.fire(c.cyan(crlf(`↳ running in background (task ${rec.backgroundTaskId})\n\n`)));
@@ -1653,7 +1665,7 @@ async function announceUrl(store, rec) {
   const mode = vscode.workspace.getConfiguration('claudeCommandCenter').get('notifyServerUrl');
   if (mode === 'never' || (mode === 'unfocused' && vscode.window.state.focused)) return;
   const pick = await vscode.window.showInformationMessage(
-    `${rec.description || rec.command.split(/\r?\n/)[0]} is serving ${rec.url}`,
+    `${commandLabel(rec)} is serving ${rec.url}`,
     'Open in Browser',
     'Open in VS Code'
   );

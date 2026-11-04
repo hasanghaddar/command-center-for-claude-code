@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.2
+
+- Commands Claude runs without a description are named after the command itself, without the leading `cd "<project folder>";` (or `&&`, `Set-Location`, `pushd`). Tabs read `Claude: npx tsc --noEmit …` instead of `Claude: cd "E:/Work/…`.
+
 ## 0.12.1
 
 - A command Claude moves to the background while it runs (a long build or deploy) keeps its tab open; only finished commands' tabs close when the next command starts.
