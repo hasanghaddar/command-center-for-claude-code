@@ -446,6 +446,19 @@ process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', async () => {
   try {
     const input = JSON.parse(raw);
+    // Sent only by the extension's "Check Setup" command, never by Claude Code:
+    // report where events would go and whether that folder is writable.
+    if (input.hook_event_name === 'CommandCenterCheck') {
+      let writable = true;
+      try {
+        fs.mkdirSync(LOG_DIR, { recursive: true });
+        fs.accessSync(LOG_DIR, fs.constants.W_OK);
+      } catch {
+        writable = false;
+      }
+      process.stdout.write(JSON.stringify({ commandCenterCheck: true, node: process.version, logDir: LOG_DIR, writable }) + '\n');
+      process.exit(0);
+    }
     if (input.hook_event_name === 'PermissionRequest') {
       await askVsCode(input);
       process.exit(0);

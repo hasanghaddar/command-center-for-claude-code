@@ -201,4 +201,19 @@ function unregisterHooks() {
   return changed;
 }
 
-module.exports = { claudeDir, mergeByTime, settingsPath, defaultLogDir, installedHookPath, migrateLegacy, installHookFile, hookStatus, registerHooks, unregisterHooks };
+module.exports = {
+  EVENTS,
+  claudeDir,
+  mergeByTime,
+  settingsPath,
+  readSettings,
+  defaultLogDir,
+  installedHookPath,
+  hookCommand,
+  isOurHook,
+  migrateLegacy,
+  installHookFile,
+  hookStatus,
+  registerHooks,
+  unregisterHooks,
+};

@@ -138,7 +138,8 @@ How long it is kept:
 
 ## Troubleshooting
 
-- **Nothing shows up:** check that setup ran (**Command Center: Set Up Hooks**), then start a new Claude Code session. Hooks are read when a session starts.
+- **Nothing shows up, or no tabs open:** run **Command Center: Check Setup** (also in the Commands view's `…` menu). It runs the hook the way Claude Code does and reports what's wrong: Node.js not found, hook not registered or turned off by `disableAllHooks` or your organization, the hook writing to another folder, Claude Code sessions that sent nothing, or commands that ran outside this window's folders. Include its report when you open an issue.
+- **Sessions started before setup** don't record anything: Claude Code reads hooks when a session starts, so restart them.
 - **Raw hook data:** create an empty file `~/.claude/command-center/log/debug`, and the hook also writes everything it receives to `~/.claude/command-center/log/raw.jsonl`.
 
 Questions or problems: [open an issue](https://github.com/hasanghaddar/command-center-for-claude-code/issues) or email [info@hynexia.net](mailto:info@hynexia.net).

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.0
+
+- **Command Center: Check Setup** (also in the Commands view's `…` menu) finds out why commands don't show up. It runs the registered hook the way Claude Code does (with Git Bash on Windows) and reports, with a fix for each: Node.js missing from the hook's PATH, the hook not registered or out of date, hooks turned off (`disableAllHooks`, managed settings), the hook writing to a different folder, Claude Code sessions from the last 24 hours that sent nothing, and commands that ran outside this window's folders.
+- A warning appears when an open Claude Code session in this window has sent nothing for 5 minutes although the hook is set up, with a button to run the check.
+
 ## 0.12.2
 
 - Commands Claude runs without a description are named after the command itself, without the leading `cd "<project folder>";` (or `&&`, `Set-Location`, `pushd`). Tabs read `Claude: npx tsc --noEmit …` instead of `Claude: cd "E:/Work/…`.

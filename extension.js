@@ -8,6 +8,7 @@ const path = require('path');
 const cp = require('child_process');
 const { Dashboard, folderLabel } = require('./dashboard');
 const hookSetup = require('./hook-setup');
+const setupCheck = require('./setup-check');
 const sessions = require('./sessions');
 const { findTaskPids, killTree, listProcesses, matchTaskProcesses, processTree } = require('./processes');
 const { TranscriptViews } = require('./transcript-view');
@@ -1912,6 +1913,7 @@ async function runSetup(context) {
     await addSkipShell();
   } catch {}
   await context.globalState.update('setupDeclined', false);
+  await context.globalState.update('hookOkSince', Date.now());
   vscode.window.showInformationMessage(
     'Command Center for Claude Code is set up. Start a new Claude Code session (or restart the current one) to begin recording.'
   );
@@ -1928,7 +1930,11 @@ async function checkSetup(context) {
   } catch {
     return; // settings.json unreadable; the setup command reports details
   }
-  if (status === 'ok') return;
+  if (status === 'ok') {
+    // Sessions started after this should send events (see warnIfNoEvents).
+    if (!context.globalState.get('hookOkSince')) await context.globalState.update('hookOkSince', Date.now());
+    return;
+  }
   if (status === 'missing' && context.globalState.get('setupDeclined')) return;
   const msg =
     status === 'outdated'
@@ -1937,6 +1943,97 @@ async function checkSetup(context) {
   const pick = await vscode.window.showInformationMessage(msg, status === 'outdated' ? 'Update' : 'Enable', 'Not now', "Don't ask again");
   if (pick === 'Enable' || pick === 'Update') await runSetup(context);
   else if (pick === "Don't ask again") await context.globalState.update('setupDeclined', true);
+}
+
+async function showSetupCheck(context, store, index) {
+  let result;
+  try {
+    result = await runSetupCheck(context, store, index);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Command Center: the setup check failed: ${e.message}`);
+    return;
+  }
+  const open = async () => {
+    const doc = await vscode.workspace.openTextDocument({ content: result.report, language: 'markdown' });
+    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
+  };
+  await open();
+  // Also say the outcome here: the report can open out of sight, e.g. behind a maximized panel.
+  const { errors, warnings } = result;
+  const summary = errors || warnings
+    ? `Command Center setup check: ${errors} problem${errors === 1 ? '' : 's'}, ${warnings} warning${warnings === 1 ? '' : 's'}.`
+    : 'Command Center setup check: no problems found.';
+  const show = errors ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
+  if ((await show(summary, 'Show Report')) === 'Show Report') await open();
+}
+
+async function runSetupCheck(context, store, index) {
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'Checking Command Center setup…' },
+    async () => {
+      try {
+        hookSetup.installHookFile(bundledHook(context));
+      } catch {}
+      await index.refresh(Math.max(sessionDays(), 1));
+      const items = await setupCheck.runChecks({
+        store,
+        sessions: index.sessions(),
+        logDir: logDir(),
+        workspaceFolders: (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
+        remoteName: vscode.env.remoteName,
+        scope: store.scope,
+        inScope: (r) => store.inScope(r),
+        autoOpenForeground: vscode.workspace.getConfiguration('claudeCommandCenter').get('autoOpenForeground'),
+        hookOkSince: context.globalState.get('hookOkSince'),
+      });
+      return {
+        report: setupCheck.formatReport(items, { version: context.extension.packageJSON.version, vscodeVersion: vscode.version }),
+        errors: items.filter((i) => i.level === 'error').length,
+        warnings: items.filter((i) => i.level === 'warn').length,
+      };
+    }
+  );
+}
+
+// The hook is registered, but open Claude Code sessions in this window's
+// folders, started since, have sent nothing: Claude Code isn't running it.
+// Warns once per session.
+function noEventsWarner(context, store, index) {
+  const warned = new Set();
+  let last = Date.now(); // first look a minute after activation
+  return () => {
+    if (Date.now() - last < 60 * 1000) return;
+    last = Date.now();
+    const since = context.globalState.get('hookOkSince');
+    if (!since || context.globalState.get('noEventsWarningOff')) return;
+    const missing = setupCheck
+      .unrecordedSessions({
+        store,
+        sessions: index.sessions().filter((s) => s.live && (s.firstTs || 0) > since),
+        since,
+        inScope: (s) => store.inScope({ cwd: s.cwd }),
+        settled: 5 * 60 * 1000,
+      })
+      .filter((s) => !warned.has(s.id));
+    if (!missing.length) return;
+    try {
+      if (hookSetup.hookStatus() !== 'ok') return; // the setup prompt covers that
+    } catch {
+      return;
+    }
+    for (const s of missing) warned.add(s.id);
+    const which = missing.length === 1 ? `"${sessionLabel(missing[0])}"` : `${missing.length} open sessions`;
+    vscode.window
+      .showWarningMessage(
+        `Command Center isn't receiving anything from the Claude Code session ${which}, so its commands don't show here. Check the setup to see why.`,
+        'Check Setup',
+        "Don't Warn Again"
+      )
+      .then((pick) => {
+        if (pick === 'Check Setup') vscode.commands.executeCommand('claudeCommandCenter.checkSetup');
+        else if (pick === "Don't Warn Again") context.globalState.update('noEventsWarningOff', true);
+      });
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1990,11 +2087,13 @@ function activate(context) {
   // Transcripts are re-read every few seconds while the window has focus.
   let lastRefresh = 0;
   let lastSignature = '';
+  const warnIfNoEvents = noEventsWarner(context, store, index);
   const refreshSessions = async (force) => {
     if (!force && !vscode.window.state.focused && Date.now() - lastRefresh < 30 * 1000) return;
     lastRefresh = Date.now();
     await index.refresh(sessionDays());
     updateUsage();
+    warnIfNoEvents();
     const list = sessionsProvider.list();
     const signature = list.map((s) => s.id + s.lastTs + s.live + s.title).join('|');
     if (signature === lastSignature) return;
@@ -2041,6 +2140,7 @@ function activate(context) {
   reg('claudeCommandCenter.openFeed', () => terminals.openFeed());
   reg('claudeCommandCenter.dashboard', () => dashboard.show());
   reg('claudeCommandCenter.setup', () => runSetup(context));
+  reg('claudeCommandCenter.checkSetup', () => showSetupCheck(context, store, index));
   reg('claudeCommandCenter.removeHooks', async () => {
     const pick = await vscode.window.showWarningMessage(
       'Remove the Command Center logging hook from Claude Code? Commands and file changes stop being recorded.',
@@ -2221,7 +2321,7 @@ function activate(context) {
     if (!rec) return;
     const opts = { name: rec.description || 'Claude command', cwd: rec.cwd && fs.existsSync(rec.cwd) ? rec.cwd : undefined };
     if (process.platform === 'win32') {
-      opts.shellPath = rec.tool === 'PowerShell' ? 'powershell.exe' : findGitBash();
+      opts.shellPath = rec.tool === 'PowerShell' ? 'powershell.exe' : setupCheck.findGitBash() || undefined;
     }
     const term = vscode.window.createTerminal(opts);
     term.show();
@@ -2264,15 +2364,6 @@ function activate(context) {
   checkSetup(context);
 
   context.subscriptions.push(view, changesView, sessionsView, status, usageItem, { dispose: () => store.dispose() }, provider, terminals, permissions);
-}
-
-function findGitBash() {
-  const candidates = [
-    'C:\\Program Files\\Git\\bin\\bash.exe',
-    'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
-    path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'),
-  ];
-  return candidates.find((p) => fs.existsSync(p));
 }
 
 function deactivate() {}

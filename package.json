@@ -2,7 +2,7 @@
   "name": "command-center-for-claude-code",
   "displayName": "Command Center for Claude Code",
   "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, sessions you can resume or move between projects, notifications, token usage, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
-  "version": "0.12.2",
+  "version": "0.13.0",
   "publisher": "hynexia",
   "author": {
     "name": "Hynexia",
@@ -159,6 +159,10 @@
       {
         "command": "claudeCommandCenter.setup",
         "title": "Command Center: Set Up Hooks"
+      },
+      {
+        "command": "claudeCommandCenter.checkSetup",
+        "title": "Command Center: Check Setup"
       },
       {
         "command": "claudeCommandCenter.removeHooks",
@@ -329,6 +333,11 @@
         }
       ],
       "view/title": [
+        {
+          "command": "claudeCommandCenter.checkSetup",
+          "when": "view == claudeCommandCenter.commands",
+          "group": "9_setup@0"
+        },
         {
           "command": "claudeCommandCenter.addTerminalToChat",
           "when": "view == terminal",
