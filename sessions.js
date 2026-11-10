@@ -73,6 +73,7 @@ function newEntry(file, subagentOf) {
     title: null,
     customTitle: null,
     lastPrompt: null,
+    lastPromptTs: 0, // when the user sent their last prompt
     firstTs: 0,
     lastTs: 0,
     cost: null,
@@ -120,6 +121,13 @@ function applyLine(e, line, keepUsageSince) {
     case 'last-prompt':
       if (o.lastPrompt) e.lastPrompt = o.lastPrompt;
       break;
+    case 'user': {
+      // A prompt the user sent, not a tool result: the start of a turn.
+      const content = o.message && o.message.content;
+      const prompt = typeof content === 'string' || (Array.isArray(content) && !content.some((p) => p && p.type === 'tool_result'));
+      if (ts && prompt && !o.isMeta && !o.isSidechain && ts > e.lastPromptTs) e.lastPromptTs = ts;
+      break;
+    }
     case 'cost-state':
       if (typeof o.totalCostUSD === 'number') e.cost = o.totalCostUSD;
       break;
@@ -275,6 +283,7 @@ class SessionIndex {
         cwd: (live && live.cwd) || e.cwd,
         title: e.customTitle || e.title,
         lastPrompt: e.lastPrompt,
+        lastPromptTs: e.lastPromptTs,
         firstTs: e.firstTs,
         lastTs: e.lastTs || e.mtime,
         cost: e.cost,
@@ -371,4 +380,4 @@ function moveSession(session, targetCwd) {
   return dest;
 }
 
-module.exports = { SessionIndex, liveSessions, moveSession, projectFolderName, projectsDir, samePath };
+module.exports = { SessionIndex, liveSessions, moveSession, projectFolderName, projectsDir, samePath, applyLine, newEntry };

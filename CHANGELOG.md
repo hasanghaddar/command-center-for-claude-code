@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.0
+
+- **Failed commands in the status bar.** A count of the commands Claude ran that failed in the last 10 minutes and whose output you haven't opened. Click it to see the output (with several, pick one). Turn off with `claudeCommandCenter.showFailures`.
+- **Fewer "Claude finished" notifications.** A finished turn is only notified if it took 30 seconds or more, counted from your prompt. Change with `claudeCommandCenter.notifyTurnMinSeconds` (0 notifies for every turn).
+- **One shared tab** (optional): set `claudeCommandCenter.commandTabs` to `shared` and regular commands print into a single tab instead of one tab each. Background processes keep their own tabs.
+- The empty Commands and File Changes views offer **Check setup** next to Set up hooks.
+- Automated tests (`npm test`) for the hook, its registration, the tabs, notifications and the failure count.
+- **Node.js no longer has to be installed.** Setup tries the hook the way Claude Code runs it: with `node` when that works, otherwise with the editor's own runtime (VS Code, Cursor and other VS Code-based editors). If that editor is later moved or removed, the hook is repaired the next time Command Center starts.
+- **No tab for quick commands.** A regular command gets a terminal tab only once it has run for 2 seconds, so `git status`, `ls` and the like no longer flash a tab open. Change the wait with `claudeCommandCenter.autoOpenDelay` (0 opens every command at once).
+- **Claude's tabs no longer take over your terminal.** After you switch to a terminal of your own (a shell, or Claude Code running in a terminal), tabs for the commands Claude runs open in the terminal list without coming to the front. Select any of Claude's tabs and they come to the front again.
+
 ## 0.13.0
 
 - **Command Center: Check Setup** (also in the Commands view's `…` menu) finds out why commands don't show up. It runs the registered hook the way Claude Code does (with Git Bash on Windows) and reports, with a fix for each: Node.js missing from the hook's PATH, the hook not registered or out of date, hooks turned off (`disableAllHooks`, managed settings), the hook writing to a different folder, Claude Code sessions from the last 24 hours that sent nothing, and commands that ran outside this window's folders.

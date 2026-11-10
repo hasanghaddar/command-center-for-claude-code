@@ -2,7 +2,7 @@
   "name": "command-center-for-claude-code",
   "displayName": "Command Center for Claude Code",
   "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, sessions you can resume or move between projects, notifications, token usage, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "publisher": "hynexia",
   "author": {
     "name": "Hynexia",
@@ -84,11 +84,11 @@
     "viewsWelcome": [
       {
         "view": "claudeCommandCenter.commands",
-        "contents": "No commands recorded yet.\n\n[Set up hooks](command:claudeCommandCenter.setup)\n\nThen start a new Claude Code session and let Claude run a command.\n[Open dashboard](command:claudeCommandCenter.dashboard)\n[Open live feed](command:claudeCommandCenter.openFeed)"
+        "contents": "No commands recorded yet.\n\n[Set up hooks](command:claudeCommandCenter.setup)\n\nThen start a new Claude Code session and let Claude run a command.\n\nAlready set up and still nothing here?\n[Check setup](command:claudeCommandCenter.checkSetup)\n[Open dashboard](command:claudeCommandCenter.dashboard)\n[Open live feed](command:claudeCommandCenter.openFeed)"
       },
       {
         "view": "claudeCommandCenter.changes",
-        "contents": "No file changes recorded yet.\n\nEvery file Claude edits shows up here, with a diff.\n[Set up hooks](command:claudeCommandCenter.setup)"
+        "contents": "No file changes recorded yet.\n\nEvery file Claude edits shows up here, with a diff.\n[Set up hooks](command:claudeCommandCenter.setup)\n[Check setup](command:claudeCommandCenter.checkSetup)"
       },
       {
         "view": "claudeCommandCenter.sessions",
@@ -167,6 +167,10 @@
       {
         "command": "claudeCommandCenter.removeHooks",
         "title": "Command Center: Remove Hooks"
+      },
+      {
+        "command": "claudeCommandCenter.showFailures",
+        "title": "Command Center: Show Failed Commands"
       },
       {
         "command": "claudeCommandCenter.addTerminalToChat",
@@ -691,7 +695,31 @@
         "claudeCommandCenter.autoOpenForeground": {
           "type": "boolean",
           "default": true,
-          "description": "Open a terminal tab whenever Claude starts a regular (foreground) command. Its output streams live. Tabs of finished commands close when the next one opens; reopen them from the dashboard or Commands view."
+          "description": "Open a terminal tab whenever Claude starts a regular (foreground) command. Its output streams live. Tabs of finished commands close when the next one opens; reopen them from the dashboard or Commands view. While you are on a terminal of your own, new tabs open in the terminal list without coming to the front; select one of Claude's tabs to follow them again."
+        },
+        "claudeCommandCenter.autoOpenDelay": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "description": "Seconds a regular command must have been running before its terminal tab opens, so quick commands (git status, ls, …) don't flash a tab open. Their output is still in the Commands view and dashboard. 0 opens a tab for every command right away."
+        },
+        "claudeCommandCenter.commandTabs": {
+          "type": "string",
+          "enum": [
+            "perCommand",
+            "shared"
+          ],
+          "enumDescriptions": [
+            "Each command opens its own tab, which closes when the next one opens",
+            "All regular commands print into one tab, one below the other"
+          ],
+          "default": "perCommand",
+          "description": "Where the live output of regular commands opens. Background processes always get their own tab."
+        },
+        "claudeCommandCenter.showFailures": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a count in the status bar when commands Claude ran have failed in the last 10 minutes and their output hasn't been opened. Click it to see the output."
         },
         "claudeCommandCenter.resourceUsage": {
           "type": "boolean",
@@ -778,6 +806,12 @@
           "default": "never",
           "description": "Notify when a subagent finishes."
         },
+        "claudeCommandCenter.notifyTurnMinSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "description": "Only notify that Claude finished when the turn took at least this many seconds, counted from your prompt. 0 notifies for every turn."
+        },
         "claudeCommandCenter.notifySubagentMinSeconds": {
           "type": "number",
           "default": 60,
@@ -827,6 +861,7 @@
   },
   "scripts": {
     "vscode:uninstall": "node ./uninstall.js",
+    "test": "node --test --test-force-exit --test-timeout=30000 \"test/*.test.js\"",
     "package": "npx --yes @vscode/vsce package",
     "publish:vscode": "npx --yes @vscode/vsce publish",
     "publish:openvsx": "npx --yes ovsx publish"

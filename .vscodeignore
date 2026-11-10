@@ -3,3 +3,4 @@
 .gitattributes
 media/screenshot-*.png
 .env
+test/**

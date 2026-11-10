@@ -212,7 +212,7 @@ async function runChecks(ctx) {
       run.timedOut ? 'The hook did not finish within 15 seconds' : notFound ? 'Node.js was not found when running the hook' : 'The hook failed to run',
       `Command: ${command}\nShell: ${run.shell}${run.code != null ? `\nExit code: ${run.code}` : ''}${output ? `\nOutput:\n${output.slice(0, 2000)}` : ''}`,
       notFound
-        ? 'Install Node.js from https://nodejs.org/ (the hook needs it, separately from VS Code), then restart VS Code and Claude Code. If Node.js comes from nvm, Volta or fnm, make sure it is on the PATH that apps (not only terminals) get.'
+        ? 'Run "Command Center: Set Up Hooks": it switches the hook to the runtime built into this editor, so Node.js is not needed. Then restart open Claude Code sessions.'
         : 'Run "Command Center: Set Up Hooks", then run this check again. If it still fails, the output above says why.'
     );
   }
@@ -291,4 +291,4 @@ function formatReport(items, meta) {
   return lines.join('\n');
 }
 
-module.exports = { runChecks, formatReport, unrecordedSessions, findGitBash };
+module.exports = { runChecks, runHook, formatReport, unrecordedSessions, findGitBash };

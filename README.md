@@ -23,7 +23,9 @@ One place in VS Code to watch, control and feed context to Claude Code:
 **Commands**
 - A **Command Center** sidebar and a full **dashboard** tab listing every Bash and PowerShell command Claude runs: status, folder, duration, exit code and colored output.
 - Click the **Running**, **Background** or **Failed** counts to filter. Search with `/`, move with ↑/↓.
-- **Live output**: each command Claude runs opens a tab that streams its output as it runs. When the next command starts, tabs of finished ones close (reopen them from the list).
+- **Live output**: a command Claude runs for more than 2 seconds opens a tab that streams its output as it runs. When the next one opens, tabs of finished ones close (reopen them from the list). While you're on a terminal of your own, these tabs open in the terminal list without coming to the front; select one to follow them again.
+- **One shared tab** if you prefer: set `claudeCommandCenter.commandTabs` to `shared` and regular commands print into a single tab, one below the other, with the tab's title following the current one.
+- **Failed commands** show as a count in the status bar for 10 minutes, until you open their output. Click it to see what failed.
 - **Background processes** (dev servers, watchers) stream their output live, open a log tab automatically, and switch to done or failed when they exit.
 - **CPU and memory** of running commands, summed over everything they started, in the list and the tab title, with peak memory when they finish. Measured only while the window is focused and you're looking (the Commands view or the command's tab), every 10 seconds on Windows and 3 on macOS and Linux, and less often for long-running processes or on a busy machine. Turn off with `claudeCommandCenter.resourceUsage`.
 - **Stop** a background process. It finds the exact process Claude started and stops its whole process tree, after asking you.
@@ -47,7 +49,7 @@ One place in VS Code to watch, control and feed context to Claude Code:
 - **Revert** a whole session's edits, **Claude's last turn**, or **an edit and everything after it** in that session. You pick the files. Any file you've changed since Claude's edit is unticked, so your own work isn't overwritten by accident. The current versions are saved first, and **Undo** puts them back.
 
 **Notifications**
-- When Claude **finishes a turn**, or **needs permission or an answer**, in a project open in that window. By default only while the window isn't focused.
+- When Claude **finishes a turn**, or **needs permission or an answer**, in a project open in that window. By default only while the window isn't focused, and for a finished turn only if it took 30 seconds or more.
 - Optionally when a **subagent finishes**, if it ran longer than a minute.
 
 **Answer permission prompts from VS Code** (off by default, `claudeCommandCenter.answerPermissions`)
@@ -81,7 +83,7 @@ Run **Command Center: Set Up Hooks** to redo it, or **Command Center: Remove Hoo
 **Requirements**
 - VS Code 1.90 or later.
 - [Claude Code](https://code.claude.com). Its VS Code extension is needed for **Add to Claude Chat**; without it, mentions are copied to the clipboard instead.
-- [Node.js](https://nodejs.org) on your PATH, which the logging hook runs with.
+- Nothing else to install: the logging hook runs with [Node.js](https://nodejs.org) when it's on your PATH, and with the editor's own runtime when it isn't.
 
 ## Privacy
 
@@ -109,11 +111,15 @@ How long it is kept:
 | `claudeCommandCenter.scope` | `workspace` | Show only this window's projects, or `all`. |
 | `claudeCommandCenter.autoOpenBackground` | `true` | Open a live log tab when Claude starts a background process. |
 | `claudeCommandCenter.autoOpenForeground` | `true` | Open a tab when Claude starts a regular command. Output streams live, and the tab closes when the next command opens. |
+| `claudeCommandCenter.autoOpenDelay` | `2` | Seconds a regular command must have been running before its tab opens. `0` opens every command at once. |
+| `claudeCommandCenter.commandTabs` | `perCommand` | `shared` prints all regular commands into one tab. Background processes always get their own. |
+| `claudeCommandCenter.showFailures` | `true` | Count recently failed commands in the status bar. |
 | `claudeCommandCenter.resourceUsage` | `true` | Show CPU and memory of running commands. Only measured while you're looking. |
 | `claudeCommandCenter.retentionDays` | `7` | Days to keep edit snapshots. `0` keeps them forever. |
 | `claudeCommandCenter.chatFileRetentionHours` | `24` | Hours to keep files made for chat mentions. `0` keeps them forever. |
 | `claudeCommandCenter.maxItems` | `200` | Most items shown per list. |
 | `claudeCommandCenter.notifyTurnEnd` | `unfocused` | Notify when Claude finishes a turn: `always`, `unfocused` or `never`. |
+| `claudeCommandCenter.notifyTurnMinSeconds` | `30` | Skip turns shorter than this, counted from your prompt. `0` notifies for every turn. |
 | `claudeCommandCenter.notifyAttention` | `unfocused` | Notify when Claude needs permission or an answer. |
 | `claudeCommandCenter.notifySubagentEnd` | `never` | Notify when a subagent finishes. |
 | `claudeCommandCenter.notifySubagentMinSeconds` | `60` | Skip subagents shorter than this. |
@@ -127,6 +133,7 @@ How long it is kept:
 ## Known limitations
 
 - **Live foreground output** is read from the file Claude Code writes it to, matched to the command by when it started. If Claude runs several commands at the same moment, a tab can show another one's output while they run; the real result is printed below it when the command ends.
+- **Shared tab**: when Claude runs several commands at once, the tab follows the one that started last; the others print their result there when they end.
 - **CPU and memory** are what the command's own processes use on this machine (work it hands to Docker or a remote service isn't counted). Peak memory is the highest seen while it was being measured. On Linux, CPU is each process's average since it started rather than right now.
 - **Tested on Windows and macOS.** Linux is supported but not yet verified, Stop in particular: it may not find the process there.
 - **Files changed by shell commands** are only tracked inside a git repository (git-ignored files, such as build output, aren't), and not for background commands, which change files after their hook has run. Changes made by anything else while a command runs, such as another Claude session or a background dev server, are counted as that command's.

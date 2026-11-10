@@ -5,7 +5,6 @@ const vscode = require('vscode');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const cp = require('child_process');
 const { Dashboard, folderLabel } = require('./dashboard');
 const hookSetup = require('./hook-setup');
 const setupCheck = require('./setup-check');
@@ -823,14 +822,76 @@ function resultText(rec) {
   return out ? crlf(out.endsWith('\n') ? out : out + '\n') : '';
 }
 
+// The one tab all regular commands share when claudeCommandCenter.commandTabs
+// is "shared": each command that opens is printed below the ones before it,
+// and the tab's title follows the current one.
+class SharedTerminal {
+  constructor(manager) {
+    this.manager = manager;
+    this.current = null; // the RecordTerminal printing here now
+    this.buffer = []; // written before the tab was ready
+    this.used = false;
+    const writeEmitter = new vscode.EventEmitter();
+    this.nameEmitter = new vscode.EventEmitter();
+    this.emit = (s) => writeEmitter.fire(s);
+    this.terminal = vscode.window.createTerminal({
+      name: 'Claude: commands',
+      pty: {
+        onDidWrite: writeEmitter.event,
+        onDidChangeName: this.nameEmitter.event,
+        open: () => {
+          this.opened = true;
+          for (const s of this.buffer.splice(0)) this.emit(s);
+          if (this.name) this.nameEmitter.fire(this.name);
+        },
+        close: () => {
+          if (manager.shared === this) manager.shared = null;
+          if (this.current) this.current.dispose(true);
+        },
+        handleInput: () => {},
+      },
+      iconPath: new vscode.ThemeIcon('terminal'),
+      isTransient: true,
+    });
+  }
+
+  write(s) {
+    if (this.opened) this.emit(s);
+    else this.buffer.push(s);
+  }
+
+  setName(name) {
+    this.name = name;
+    if (this.opened) this.nameEmitter.fire(name);
+  }
+
+  // Hand the tab to the next command.
+  attach(t) {
+    if (this.current && this.current !== t) this.current.detach();
+    this.current = t;
+    if (this.used) this.write('\r\n');
+    this.used = true;
+  }
+}
+
 class RecordTerminal {
-  constructor(manager, rec) {
+  constructor(manager, rec, shared) {
     this.manager = manager;
     this.rec = rec;
-    this.writeEmitter = new vscode.EventEmitter();
-    this.nameEmitter = new vscode.EventEmitter();
     this.tailOffset = 0;
     this.wroteResult = false;
+    this.name = `Claude: ${commandLabel(rec).slice(0, 40)}`;
+    if (shared) {
+      this.shared = shared;
+      this.writeEmitter = { fire: (s) => shared.write(s) };
+      this.nameEmitter = { fire: (name) => shared.setName(name) };
+      this.terminal = shared.terminal;
+      shared.attach(this);
+      this.render();
+      return;
+    }
+    this.writeEmitter = new vscode.EventEmitter();
+    this.nameEmitter = new vscode.EventEmitter();
     const pty = {
       onDidWrite: this.writeEmitter.event,
       onDidChangeName: this.nameEmitter.event,
@@ -838,7 +899,6 @@ class RecordTerminal {
       close: () => this.dispose(true),
       handleInput: () => {},
     };
-    this.name = `Claude: ${commandLabel(rec).slice(0, 40)}`;
     this.terminal = vscode.window.createTerminal({
       name: this.name,
       pty,
@@ -856,8 +916,26 @@ class RecordTerminal {
     this.update();
   }
 
+  // The shared tab moved on to a newer command. One still running prints its
+  // result there when it ends.
+  detach() {
+    clearInterval(this.liveTimer);
+    clearInterval(this.tailTimer);
+    this.liveTimer = null;
+    if (this.rec.status === 'running') this.detached = true;
+    else this.manager.terminals.delete(this.rec.id);
+  }
+
   update() {
     const rec = this.rec;
+    if (this.detached) {
+      if (rec.status === 'running') return;
+      this.manager.terminals.delete(rec.id);
+      if (rec.status === 'background') return;
+      const label = c.dim(`[${formatTime(rec.endTs || Date.now())}] ← ${commandLabel(rec)}`);
+      this.write(crlf(`\n${label}\n`) + resultText(rec) + footer(rec));
+      return;
+    }
     this.showUsage();
     if (rec.status === 'running') {
       if (!this.wroteRunning) {
@@ -999,7 +1077,7 @@ class RecordTerminal {
     clearInterval(this.tailTimer);
     clearInterval(this.liveTimer);
     this.manager.terminals.delete(this.rec.id);
-    if (!fromClose) this.terminal.dispose();
+    if (!fromClose && !this.shared) this.terminal.dispose();
   }
 }
 
@@ -1046,6 +1124,19 @@ class TerminalManager {
     this.terminals = new Map();
     this.liveClaims = new Set(); // output files of running foreground commands
     this.feed = null;
+    this.shared = null; // the SharedTerminal, once a command has used it
+    // Whether tabs opened for Claude's commands come to the front. Turned off
+    // when the user switches to a terminal of their own (so their typing isn't
+    // interrupted) and back on when they select one of Claude's tabs.
+    this.following = true;
+    this.pending = new Map(); // record id -> timer that opens its tab if it is still running
+    this.selfClosedAt = 0; // when closeFinished last closed the tab that was showing
+    this.activeSub = vscode.window.onDidChangeActiveTerminal((t) => {
+      const ours = !t || this.isOurs(t);
+      // Closing our own tab makes VS Code fall back to another terminal; that isn't the user's choice.
+      if (!ours && Date.now() - this.selfClosedAt < 1000) return;
+      this.following = ours;
+    });
     store.onRecord(({ rec, type }) => {
       if (rec.liveFile && rec.status !== 'running') this.liveClaims.delete(rec.liveFile);
       const t = this.terminals.get(rec.id);
@@ -1055,9 +1146,21 @@ class TerminalManager {
       if (this.feed) this.feed.event(rec, type);
       const config = vscode.workspace.getConfiguration('claudeCommandCenter');
       if (type === 'start' && !rec.background && config.get('autoOpenForeground')) {
-        this.closeFinished();
-        this.open(rec, true);
-      } else if (type === 'end' && rec.status === 'background' && config.get('autoOpenBackground')) {
+        // Most commands finish at once; a tab only for those still running after the delay.
+        const delay = Math.max(0, Number(config.get('autoOpenDelay')) || 0) * 1000;
+        const openNow = () => {
+          this.pending.delete(rec.id);
+          if (rec.status !== 'running') return;
+          this.closeFinished();
+          this.open(rec, true);
+        };
+        if (delay) this.pending.set(rec.id, setTimeout(openNow, Math.max(0, rec.startTs + delay - Date.now())));
+        else openNow();
+      } else if (type !== 'start' && rec.status !== 'running' && this.pending.has(rec.id)) {
+        clearTimeout(this.pending.get(rec.id));
+        this.pending.delete(rec.id);
+      }
+      if (type === 'end' && rec.status === 'background' && config.get('autoOpenBackground')) {
         this.open(rec, true);
       }
     });
@@ -1066,13 +1169,29 @@ class TerminalManager {
   // auto: opened because Claude ran it, not by the user; such tabs of
   // finished commands are closed when the next command opens.
   open(rec, auto = false) {
+    // Decided before the tab exists: creating it can change the active terminal.
+    const reveal = !auto || this.following;
     let t = this.terminals.get(rec.id);
     if (!t) {
-      t = new RecordTerminal(this, rec);
+      // A running command Claude just started goes to the shared tab, if that is on.
+      const share =
+        auto &&
+        !rec.background &&
+        rec.status === 'running' &&
+        vscode.workspace.getConfiguration('claudeCommandCenter').get('commandTabs') === 'shared';
+      if (share && !this.shared) this.shared = new SharedTerminal(this);
+      t = new RecordTerminal(this, rec, share ? this.shared : undefined);
       this.terminals.set(rec.id, t);
     }
     t.auto = auto && t.auto !== false;
-    t.show();
+    if (reveal) t.show(); // otherwise it waits in the terminal list
+  }
+
+  isOurs(terminal) {
+    if (this.feed && this.feed.terminal === terminal) return true;
+    if (this.shared && this.shared.terminal === terminal) return true;
+    for (const t of this.terminals.values()) if (t.terminal === terminal) return true;
+    return false;
   }
 
   // The output file of a running foreground command: the unclaimed one in its
@@ -1116,7 +1235,10 @@ class TerminalManager {
   closeFinished() {
     for (const t of [...this.terminals.values()]) {
       // A command moved to the background mid-run is still going; keep it.
-      if (t.auto && !t.rec.background && t.rec.status !== 'running' && t.rec.status !== 'background') t.dispose();
+      if (t.auto && !t.shared && !t.rec.background && t.rec.status !== 'running' && t.rec.status !== 'background') {
+        if (t.terminal === vscode.window.activeTerminal) this.selfClosedAt = Date.now();
+        t.dispose();
+      }
     }
   }
 
@@ -1126,7 +1248,12 @@ class TerminalManager {
   }
 
   dispose() {
-    for (const t of this.terminals.values()) clearInterval(t.tailTimer);
+    this.activeSub.dispose();
+    for (const timer of this.pending.values()) clearTimeout(timer);
+    for (const t of this.terminals.values()) {
+      clearInterval(t.tailTimer);
+      clearInterval(t.liveTimer);
+    }
   }
 }
 
@@ -1484,19 +1611,32 @@ class Notifier {
     return mode === 'always' || (mode === 'unfocused' && !vscode.window.state.focused);
   }
 
-  handle(ev) {
+  // Whether the turn that just ended was shorter than notifyTurnMinSeconds.
+  // A turn starts at the user's last prompt in the transcript; when that
+  // isn't known, the turn counts as long.
+  async shortTurn(ev) {
+    const min = (vscode.workspace.getConfiguration('claudeCommandCenter').get('notifyTurnMinSeconds') || 0) * 1000;
+    if (!min) return false;
+    try {
+      await this.index.refresh(sessionDays()); // the prompt may not have been read yet
+    } catch {}
+    const started = (this.index.get(ev.session) || {}).lastPromptTs;
+    return !!started && started <= ev.ts && ev.ts - started < min;
+  }
+
+  async handle(ev) {
     if (ev.type === 'subagentStart') {
       if (ev.agentId) this.subagents.set(ev.agentId, ev.ts);
       return;
     }
     if (!inWorkspace(ev.cwd)) return;
+    if (ev.type === 'turnEnd' && (!this.wanted('notifyTurnEnd') || (await this.shortTurn(ev)))) return;
     const s = this.index.get(ev.session) || { id: ev.session, cwd: ev.cwd };
     const where = s.title || s.lastPrompt ? sessionLabel(s) : path.basename(ev.cwd || '') || 'Claude Code';
     const snippet = (ev.message || '').split(/\r?\n/).find((l) => l.trim()) || '';
     const clip = (t) => (t.length > 140 ? t.slice(0, 140) + '…' : t);
 
     if (ev.type === 'turnEnd') {
-      if (!this.wanted('notifyTurnEnd')) return;
       const last = this.lastTurnEnd.get(ev.session) || 0;
       if (ev.ts - last < 20 * 1000) return;
       this.lastTurnEnd.set(ev.session, ev.ts);
@@ -1520,6 +1660,80 @@ class Notifier {
     const fn = level === 'warning' ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
     const pick = await fn(text, 'Open Session');
     if (pick) openSession(this.index.get(s.id) || s);
+  }
+}
+
+// Status bar: commands that failed in the last 10 minutes and whose output
+// hasn't been opened. Quick commands get no tab, so this is where a failure shows.
+const FAILURE_FRESH_MS = 10 * 60 * 1000;
+
+class FailureIndicator {
+  constructor(store, terminals) {
+    this.store = store;
+    this.terminals = terminals;
+    this.since = Date.now(); // failures from before the window opened are not shown
+    this.seen = new Set(); // record ids whose output has been opened
+    this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49.5);
+    this.item.command = 'claudeCommandCenter.showFailures';
+    this.sub = store.onRecord(({ rec }) => rec.kind !== 'change' && this.update());
+    this.timer = setInterval(() => this.update(), 60 * 1000);
+  }
+
+  list() {
+    const now = Date.now();
+    const out = [];
+    for (const r of this.store.records.values()) {
+      if (r.status !== 'failed' || !(r.endTs >= this.since) || now - r.endTs > FAILURE_FRESH_MS) continue;
+      if (this.terminals.terminals.has(r.id)) this.seen.add(r.id); // it has a tab
+      if (!this.seen.has(r.id) && this.store.inScope(r)) out.push(r);
+    }
+    return out.sort((a, b) => b.endTs - a.endTs);
+  }
+
+  update() {
+    const failed = vscode.workspace.getConfiguration('claudeCommandCenter').get('showFailures') ? this.list() : [];
+    if (!failed.length) return this.item.hide();
+    this.item.text = `$(error) ${failed.length} failed`;
+    const md = new vscode.MarkdownString(`**Commands Claude ran that failed** (last 10 minutes)\n\n`);
+    for (const r of failed.slice(0, 8)) {
+      const code = r.exitCode != null ? ` · exit ${r.exitCode}` : '';
+      md.appendMarkdown('- ');
+      md.appendText(commandLabel(r).slice(0, 80));
+      md.appendMarkdown(` _(${formatTime(r.endTs)}${code})_\n`);
+    }
+    md.appendMarkdown('\nClick to see the output.');
+    this.item.tooltip = md;
+    this.item.show();
+  }
+
+  // Open the failed command's output; with several, pick one. Either way they
+  // have now been looked at.
+  async open() {
+    const failed = this.list();
+    for (const r of failed) this.seen.add(r.id);
+    this.update();
+    if (!failed.length) return;
+    let rec = failed[0];
+    if (failed.length > 1) {
+      const pick = await vscode.window.showQuickPick(
+        failed.map((r) => ({
+          label: commandLabel(r),
+          description: `${formatTime(r.endTs)}${r.exitCode != null ? ` · exit ${r.exitCode}` : ''}`,
+          detail: (r.stderr || r.stdout || '').trim().split(/\r?\n/).pop().slice(0, 200) || undefined,
+          rec: r,
+        })),
+        { placeHolder: 'Failed commands: pick one to see its output' }
+      );
+      if (!pick) return;
+      rec = pick.rec;
+    }
+    this.terminals.open(rec);
+  }
+
+  dispose() {
+    clearInterval(this.timer);
+    this.sub.dispose();
+    this.item.dispose();
   }
 }
 
@@ -1877,8 +2091,14 @@ function bundledHook(context) {
   return path.join(context.extensionPath, 'hook', 'log-hook.js');
 }
 
-function nodeAvailable() {
-  return new Promise((resolve) => cp.execFile('node', ['--version'], { windowsHide: true }, (err) => resolve(!err)));
+// The command to register the hook with, tried the way Claude Code runs it:
+// plain `node` when that works, otherwise this editor's own runtime, so
+// Node.js doesn't have to be installed. null when neither runs.
+async function pickHookCommand() {
+  for (const command of [hookSetup.hookCommand(), hookSetup.runtimeHookCommand(process.execPath)]) {
+    if ((await setupCheck.runHook(command)).report) return command;
+  }
+  return null;
 }
 
 async function addSkipShell() {
@@ -1889,17 +2109,29 @@ async function addSkipShell() {
   }
 }
 
-async function runSetup(context) {
-  if (!(await nodeAvailable())) {
-    vscode.window.showWarningMessage(
-      'Command Center for Claude Code needs Node.js on your PATH to run its logging hook. Install Node.js, then run "Command Center: Set Up Hooks".',
-      'Get Node.js'
-    ).then((pick) => pick && vscode.env.openExternal(vscode.Uri.parse('https://nodejs.org/')));
+async function runSetup(context, repaired) {
+  try {
+    hookSetup.installHookFile(bundledHook(context));
+  } catch (e) {
+    vscode.window.showErrorMessage(`Command Center couldn't install its hook in ${hookSetup.installedHookPath()}: ${e.message}`);
+    return false;
+  }
+  const command = await pickHookCommand();
+  if (!command) {
+    vscode.window
+      .showWarningMessage(
+        'Command Center couldn\'t run its logging hook, with Node.js or with this editor\'s own runtime. Run "Command Center: Check Setup" to see why.',
+        'Check Setup',
+        'Get Node.js'
+      )
+      .then((pick) => {
+        if (pick === 'Check Setup') vscode.commands.executeCommand('claudeCommandCenter.checkSetup');
+        else if (pick) vscode.env.openExternal(vscode.Uri.parse('https://nodejs.org/'));
+      });
     return false;
   }
   try {
-    hookSetup.installHookFile(bundledHook(context));
-    hookSetup.registerHooks();
+    hookSetup.registerHooks(command);
     hookSetup.migrateLegacy(); // the old hook is unregistered now, so its copy and any late events can move
   } catch (e) {
     const pick = await vscode.window.showErrorMessage(
@@ -1915,7 +2147,9 @@ async function runSetup(context) {
   await context.globalState.update('setupDeclined', false);
   await context.globalState.update('hookOkSince', Date.now());
   vscode.window.showInformationMessage(
-    'Command Center for Claude Code is set up. Start a new Claude Code session (or restart the current one) to begin recording.'
+    repaired
+      ? 'Command Center repaired its Claude Code hook (the editor it ran on has moved or was removed). Restart open Claude Code sessions to keep recording.'
+      : 'Command Center for Claude Code is set up. Start a new Claude Code session (or restart the current one) to begin recording.'
   );
   return true;
 }
@@ -1936,6 +2170,8 @@ async function checkSetup(context) {
     return;
   }
   if (status === 'missing' && context.globalState.get('setupDeclined')) return;
+  // Registered to run on an editor that is no longer there: nothing records until it's fixed.
+  if (status === 'stale') return void (await runSetup(context, true));
   const msg =
     status === 'outdated'
       ? 'Command Center for Claude Code: your Claude Code hook is from an older setup. Update it?'
@@ -2071,6 +2307,8 @@ function activate(context) {
   const sessionsProvider = new SessionsProvider(store, index);
   const sessionsView = vscode.window.createTreeView('claudeCommandCenter.sessions', { treeDataProvider: sessionsProvider });
   new Notifier(store, index);
+  const failures = new FailureIndicator(store, terminals);
+  context.subscriptions.push(failures);
   const permissions = new PermissionBroker();
   const dashboard = new Dashboard(context, store, findTaskOutput, index);
 
@@ -2108,6 +2346,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claudeCommandCenter.showUsage')) updateUsage();
+      if (e.affectsConfiguration('claudeCommandCenter.showFailures')) failures.update();
       if (e.affectsConfiguration('claudeCommandCenter.sessionDays')) refreshSessions(true);
     })
   );
@@ -2136,7 +2375,12 @@ function activate(context) {
 
   const reg = (id, fn) => context.subscriptions.push(vscode.commands.registerCommand(id, fn));
 
-  reg('claudeCommandCenter.open', (rec) => rec && terminals.open(rec));
+  reg('claudeCommandCenter.open', (rec) => {
+    if (!rec) return;
+    terminals.open(rec);
+    failures.update(); // an opened failure is no longer counted
+  });
+  reg('claudeCommandCenter.showFailures', () => failures.open());
   reg('claudeCommandCenter.openFeed', () => terminals.openFeed());
   reg('claudeCommandCenter.dashboard', () => dashboard.show());
   reg('claudeCommandCenter.setup', () => runSetup(context));
@@ -2368,4 +2612,9 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+// _internals is for the tests in test/.
+module.exports = {
+  activate,
+  deactivate,
+  _internals: { commandLabel, Store, TerminalManager, Notifier, FailureIndicator, pickHookCommand },
+};

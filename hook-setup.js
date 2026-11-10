@@ -49,6 +49,21 @@ function hookCommand() {
   return `node "${installedHookPath().replace(/\\/g, '/')}"`;
 }
 
+// For machines without Node.js: run the hook on the editor's own runtime
+// (VS Code, Cursor, … are Electron apps, which act as Node.js with this
+// variable set). `execPath` is the extension host's process.execPath.
+function runtimeHookCommand(execPath) {
+  return `ELECTRON_RUN_AS_NODE=1 "${execPath.replace(/\\/g, '/')}" "${installedHookPath().replace(/\\/g, '/')}"`;
+}
+
+// 'ok' | 'stale' (runs on an editor that is gone or has moved) | 'other'
+function commandState(command) {
+  if (command === hookCommand()) return 'ok';
+  const m = /^ELECTRON_RUN_AS_NODE=1 "([^"]+)" "([^"]+)"$/.exec(command);
+  if (!m || m[2] !== installedHookPath().replace(/\\/g, '/')) return 'other';
+  return fs.existsSync(m[1]) ? 'ok' : 'stale';
+}
+
 // Ours, including older installs and copies registered by hand from a
 // checkout of this repo.
 function isOurHook(h) {
@@ -149,22 +164,26 @@ function installHookFile(bundledHook) {
   return true;
 }
 
-// 'ok' | 'missing' | 'outdated' (ours, but an old path or matcher)
+// 'ok' | 'missing' | 'outdated' (ours, but an old path or matcher) |
+// 'stale' (ours and current, but the editor runtime it runs on is gone)
 function hookStatus() {
   const s = readSettings();
-  const want = hookCommand();
   let ok = 0;
   let ours = 0;
+  let stale = 0;
   for (const ev of EVENTS) {
     for (const m of (s.hooks && s.hooks[ev]) || []) {
       for (const h of m.hooks || []) {
         if (!isOurHook(h)) continue;
         ours++;
-        if (h.command === want && (m.matcher || undefined) === matcherFor(ev)) ok++;
+        const state = (m.matcher || undefined) === matcherFor(ev) ? commandState(h.command) : 'other';
+        if (state === 'ok') ok++;
+        else if (state === 'stale') stale++;
       }
     }
   }
   if (ok === EVENTS.length && ours === EVENTS.length) return 'ok';
+  if (stale && ok + stale === EVENTS.length && ours === EVENTS.length) return 'stale';
   return ours ? 'outdated' : 'missing';
 }
 
@@ -174,12 +193,12 @@ function withoutOurHooks(groups) {
     .filter((m) => m.hooks.length);
 }
 
-function registerHooks() {
+function registerHooks(command = hookCommand()) {
   const s = readSettings();
   s.hooks = s.hooks || {};
   for (const ev of EVENTS) {
     s.hooks[ev] = withoutOurHooks(s.hooks[ev]);
-    const group = { hooks: [{ type: 'command', command: hookCommand(), timeout: timeoutFor(ev) }] };
+    const group = { hooks: [{ type: 'command', command, timeout: timeoutFor(ev) }] };
     if (matcherFor(ev)) group.matcher = matcherFor(ev);
     s.hooks[ev].push(group);
   }
@@ -210,6 +229,7 @@ module.exports = {
   defaultLogDir,
   installedHookPath,
   hookCommand,
+  runtimeHookCommand,
   isOurHook,
   migrateLegacy,
   installHookFile,
