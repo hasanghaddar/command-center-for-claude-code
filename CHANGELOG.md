@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1
+
+- **Readable names on macOS and Linux.** Commands Claude starts with setup steps (`source ~/.nvm/nvm.sh > /dev/null 2>&1 &&`, `nvm use 20;`, `eval "$(fnm env)" &&`, `export PATH=…;`, `source .venv/bin/activate &&`) are named after the real command, not the setup. Files such a command changes in a git repository are now found too, when a `cd` comes after the setup.
+- Tests run on Windows, macOS and Linux on every push (GitHub Actions).
+
 ## 0.14.0
 
 - **Failed commands in the status bar.** A count of the commands Claude ran that failed in the last 10 minutes and whose output you haven't opened. Click it to see the output (with several, pick one). Turn off with `claudeCommandCenter.showFailures`.

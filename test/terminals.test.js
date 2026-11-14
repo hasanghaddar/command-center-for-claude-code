@@ -35,6 +35,25 @@ test('commandLabel uses the description, or the command without its leading cd',
   assert.equal(commandLabel({ command: 'npm test\necho done' }), 'npm test');
 });
 
+test('commandLabel skips the setup steps Claude puts in front on macOS and Linux', () => {
+  const cases = {
+    'source ~/.nvm/nvm.sh > /dev/null 2>&1 && cd /Users/me/app && npm test': 'npm test',
+    'source ~/.nvm/nvm.sh >/dev/null 2>&1; nvm use 20 >/dev/null; npx tsc --noEmit': 'npx tsc --noEmit',
+    '. "$HOME/.nvm/nvm.sh" && nvm use && npm run build': 'npm run build',
+    'export NVM_DIR="$HOME/.nvm" && . "$NVM_DIR/nvm.sh" && node -v': 'node -v',
+    'eval "$(fnm env)" && fnm use 20 && pnpm test': 'pnpm test',
+    'export PATH="/opt/homebrew/bin:$PATH"; export CI=1 FOO=bar; make': 'make',
+    'source .venv/bin/activate && pytest -q': 'pytest -q',
+    'cd /Users/me/app && source ~/.nvm/nvm.sh &>/dev/null && npm start': 'npm start',
+    'source ~/.nvm/nvm.sh': 'source ~/.nvm/nvm.sh', // nothing after it: keep it
+    'export FOO=1': 'export FOO=1',
+    'sourcetree --version': 'sourcetree --version',
+    'nvm ls': 'nvm ls',
+    'echo hi && npm test': 'echo hi && npm test', // not a setup step
+  };
+  for (const [command, label] of Object.entries(cases)) assert.equal(commandLabel({ command }), label, command);
+});
+
 test('a tab opens for each command and the finished one closes when the next opens', async () => {
   const { manager, start, finish } = setup();
   const a = start('cmd A');

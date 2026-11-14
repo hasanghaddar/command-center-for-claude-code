@@ -4,3 +4,4 @@
 media/screenshot-*.png
 .env
 test/**
+.github/**

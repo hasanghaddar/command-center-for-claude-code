@@ -99,14 +99,44 @@ function git(cwd, args) {
   return cp.execFileSync('git', args, { cwd, windowsHide: true, timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
 }
 
-// Where the command runs: the session's folder, or the one a leading
-// `cd <dir> &&` / `cd <dir>;` moves to.
+// Setup steps in front of the real command that don't change the folder:
+// loading a version manager (`source ~/.nvm/nvm.sh > /dev/null 2>&1`,
+// `nvm use 20`, `eval "$(fnm env)"`) and exporting variables.
+const WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s;&|<>]+)`;
+const REDIRECTS = String.raw`(?:\s*(?:&>|[0-9]?>>?)\s*(?:&[0-9]|${WORD}))*`;
+const END = String.raw`\s*(?:;|&&|\r?\n)\s*`;
+const SETUP_STEPS = [
+  String.raw`(?:source|\.)\s+${WORD}(?:\s+${WORD})*?${REDIRECTS}`,
+  String.raw`(?:nvm|fnm|volta|asdf|pyenv|rbenv|conda)\s+(?:use|activate|shell|local)(?:\s+${WORD})*?${REDIRECTS}`,
+  String.raw`eval\s+"\$\([^)]*\)"${REDIRECTS}`,
+  String.raw`export\s+[A-Za-z_]\w*=${WORD}?(?:\s+[A-Za-z_]\w*=${WORD}?)*`,
+].map((p) => new RegExp(String.raw`^\s*${p}${END}`, 'i'));
+const LEADING_CD = new RegExp(String.raw`^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))${END}`);
+
+// Where the command runs: the session's folder, or the one the leading
+// `cd <dir> &&` / `cd <dir>;` steps move to, past any setup steps.
 function shellDir(input) {
-  const cwd = input.cwd || process.cwd();
-  const m = /^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;|\n)/.exec((input.tool_input || {}).command || '');
-  if (!m) return cwd;
-  const dir = (m[1] || m[2] || m[3]).replace(/^~(?=$|[\\/])/, os.homedir());
-  return path.resolve(cwd, dir);
+  let dir = input.cwd || process.cwd();
+  let cmd = (input.tool_input || {}).command || '';
+  for (let more = true; more; ) {
+    more = false;
+    const cd = LEADING_CD.exec(cmd);
+    if (cd) {
+      dir = path.resolve(dir, (cd[1] || cd[2] || cd[3]).replace(/^~(?=$|[\\/])/, os.homedir()));
+      cmd = cmd.slice(cd[0].length);
+      more = true;
+      continue;
+    }
+    for (const re of SETUP_STEPS) {
+      const m = re.exec(cmd);
+      if (m) {
+        cmd = cmd.slice(m[0].length);
+        more = true;
+        break;
+      }
+    }
+  }
+  return dir;
 }
 
 // Paths (relative to the repo root) that differ from HEAD or the index,

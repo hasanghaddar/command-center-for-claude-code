@@ -591,16 +591,36 @@ async function addTerminalTextToChat(copyCommand, what) {
   await addToClaudeChat([{ uri: vscode.Uri.file(file) }]);
 }
 
-// A leading `cd <dir>;` / `cd <dir> &&` (or Set-Location / pushd) that only
-// moves into the project folder before the real command.
-const LEADING_CD = /^\s*(?:cd|chdir|pushd|Set-Location|sl)(?:\s+\/d)?(?:\s+-(?:Path|LiteralPath))?\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s*(?:;|&&|\r?\n)\s*/i;
+// Setup steps that only prepare for the real command, followed by `;`, `&&`
+// or a new line: a `cd` into the project folder (or Set-Location / pushd),
+// loading a version manager (`source ~/.nvm/nvm.sh > /dev/null 2>&1`,
+// `nvm use 20`, `eval "$(fnm env)"`) and exporting variables.
+const WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s;&|<>]+)`;
+const REDIRECTS = String.raw`(?:\s*(?:&>|[0-9]?>>?)\s*(?:&[0-9]|${WORD}))*`;
+const END = String.raw`\s*(?:;|&&|\r?\n)\s*`;
+const LEADING_SETUP = [
+  String.raw`(?:cd|chdir|pushd|Set-Location|sl)(?:\s+\/d)?(?:\s+-(?:Path|LiteralPath))?\s+${WORD}`,
+  String.raw`(?:source|\.)\s+${WORD}(?:\s+${WORD})*?${REDIRECTS}`,
+  String.raw`(?:nvm|fnm|volta|asdf|pyenv|rbenv|conda)\s+(?:use|activate|shell|local)(?:\s+${WORD})*?${REDIRECTS}`,
+  String.raw`eval\s+"\$\([^)]*\)"${REDIRECTS}`,
+  String.raw`export\s+[A-Za-z_]\w*=${WORD}?(?:\s+[A-Za-z_]\w*=${WORD}?)*`,
+].map((p) => new RegExp(String.raw`^\s*${p}${END}`, 'i'));
 
 // What to call a command in lists and tab names: its description, or else its
-// first line without the `cd` into the project folder.
+// first line without the setup steps in front of it (LEADING_SETUP).
 function commandLabel(rec) {
   if (rec.description) return rec.description;
   let cmd = rec.command || '';
-  for (let m; (m = LEADING_CD.exec(cmd)) && m[0].length < cmd.length; ) cmd = cmd.slice(m[0].length);
+  for (let more = true; more; ) {
+    more = false;
+    for (const re of LEADING_SETUP) {
+      const m = re.exec(cmd);
+      if (m && m[0].length < cmd.length) {
+        cmd = cmd.slice(m[0].length);
+        more = true;
+      }
+    }
+  }
   return cmd.split(/\r?\n/)[0];
 }
 

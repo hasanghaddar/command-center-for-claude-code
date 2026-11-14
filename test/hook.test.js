@@ -64,6 +64,26 @@ test('the hook answers the setup check and records nothing for it', () => {
   assert.equal(events().length, before);
 });
 
+test('files a shell command changes are found past `source … &&` and `cd` in front of it', () => {
+  const repo = path.join(tmp, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  const git = (...args) => cp.execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
+  git('init', '-q');
+  git('-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'start');
+  fs.writeFileSync(path.join(repo, 'app.js'), 'old\n');
+  const command = `source ~/.nvm/nvm.sh > /dev/null 2>&1 && cd "${repo.replace(/\\/g, '/')}" && sed -i s/old/new/ app.js`;
+  // The session started in tmp, which isn't a git repository: only the cd says where the command runs.
+  const call = { session_id: 's2', tool_name: 'Bash', tool_use_id: 'shell1', cwd: tmp, tool_input: { command } };
+  runHook({ ...call, hook_event_name: 'PreToolUse' });
+  fs.writeFileSync(path.join(repo, 'app.js'), 'new\n'); // what the command did
+  runHook({ ...call, hook_event_name: 'PostToolUse', tool_response: { stdout: '', stderr: '', exitCode: 0 } });
+  const changed = events().filter((e) => e.type === 'fileEnd' && e.toolId === 'shell1');
+  assert.deepEqual(
+    changed.map((e) => path.basename(e.file)),
+    ['app.js']
+  );
+});
+
 test('the hook exits 0 and prints nothing on input it cannot read', () => {
   assert.equal(cp.execFileSync(process.execPath, [HOOK], { input: 'not json', encoding: 'utf8', cwd: tmp }), '');
 });
