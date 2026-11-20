@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.1
+
+- **Tabs no longer pile up in the terminal list.**
+  - The tab of a background process (a build, a watcher) now closes like any other once the process has ended. Before, it stayed for good, and with tabs opening quietly since 0.15.0 they collected unnoticed. A process that is still running keeps its tab.
+  - When a command or process ends, only the latest finished tab stays, so what Claude just ran can still be looked at.
+  - Tabs left behind when the extension is updated or restarted are closed at startup. They had nothing writing to them and nothing to close them. A Claude Code session resumed in a terminal is not touched.
+- The history file is told apart from its replacement exactly. On Windows the check could, in rare cases, mistake one file for another.
+
 ## 0.15.0
 
 - **Secrets are masked in the history.** Passwords in URLs, `Authorization` headers, values of settings named like a secret (`API_KEY=…`, `--password …`), keys recognisable by their shape and private keys are replaced with `***` before a command or its output is recorded. What was recorded earlier is masked once, shortly after the update. Ordinary code that only mentions `password` or `token` is left readable. Turn off with `claudeCommandCenter.maskSecrets`.

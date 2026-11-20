@@ -111,6 +111,7 @@ test('by default tabs open without coming to the front, and the one being read s
   const tabA = manager.terminals.get(a.id).terminal;
   assert.ok(tabA, 'the tab is in the terminal list');
 
+  manager.pickAfterMs = 0; // in these tests the user picks a tab right after it opens
   setActiveTerminal(tabA); // the user picks it in the list
   finish(a);
   const b = start('cmd B');
@@ -123,6 +124,59 @@ test('by default tabs open without coming to the front, and the one being read s
   start('cmd C');
   await wait();
   assert.equal(tabA.disposed, true, 'closed once the user has moved on');
+  manager.dispose();
+});
+
+test('tabs of finished commands do not pile up, background processes included', async () => {
+  const { manager, start, finish } = setup({ revealTabs: false });
+  const open = () => state.terminals.filter((t) => !t.disposed).map((t) => t.name);
+  const background = (label) => {
+    const rec = start(label, { background: true });
+    Object.assign(rec, { status: 'background', backgroundTaskId: label, endTs: Date.now() });
+    manager.store.fireRecord(rec, 'end'); // the tool call returned; the process runs on
+    return rec;
+  };
+
+  const build = background('npm run build');
+  const server = background('npm run dev');
+  await wait();
+  assert.deepEqual(open(), ['Claude: npm run build', 'Claude: npm run dev'], 'each running process has its tab');
+
+  finish(build, { endTs: Date.now() + 1 }); // the build's process ends
+  assert.deepEqual(open(), ['Claude: npm run build', 'Claude: npm run dev'], 'the last thing to finish can still be looked at');
+
+  const a = start('cmd A');
+  await wait();
+  assert.deepEqual(open(), ['Claude: npm run dev', 'Claude: cmd A'], "the finished build's tab closes when the next opens; the server's stays");
+  finish(a, { endTs: Date.now() + 2 });
+  const watch = background('npm run watch');
+  await wait();
+  finish(watch, { endTs: Date.now() + 3 });
+  const b = start('cmd B');
+  await wait();
+  finish(b, { endTs: Date.now() + 4 });
+  assert.deepEqual(open(), ['Claude: npm run dev', 'Claude: cmd B'], 'only the running server and the latest finished command are left');
+  for (const t of manager.terminals.values()) t.dispose();
+  manager.dispose();
+});
+
+test('tabs left by an earlier run of the extension are closed at startup', async () => {
+  const { manager, start } = setup({ revealTabs: false });
+  const leftover = userTerminal('Claude: npm run build'); // from before the extension was updated
+  leftover.processId = Promise.resolve(-1); // nothing behind it
+  leftover.dispose = () => (leftover.disposed = true);
+  const resumed = userTerminal('Claude: Fix the login bug'); // "Resume in terminal": a real process
+  const shell = userTerminal('powershell');
+  const leftoverLikeName = userTerminal('Claude Code'); // not ours by name
+  leftoverLikeName.processId = Promise.resolve(-1);
+  for (const t of [resumed, shell, leftoverLikeName]) t.dispose = () => (t.disposed = true);
+  const running = start('cmd A');
+  await wait();
+
+  await manager.closeLeftovers();
+  assert.equal(leftover.disposed, true);
+  assert.ok(!resumed.disposed && !shell.disposed && !leftoverLikeName.disposed, 'real terminals and other names are left alone');
+  assert.equal(manager.terminals.get(running.id).terminal.disposed, false, "and so are this run's own tabs");
   manager.dispose();
 });
 

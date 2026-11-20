@@ -47,6 +47,8 @@ function tool(session, command, extra = {}) {
     start: () => hook({ ...base, hook_event_name: 'PreToolUse' }),
     end: (stdout = '', ms = 100) => hook({ ...base, hook_event_name: 'PostToolUse', duration_ms: ms, tool_response: { stdout, stderr: '', interrupted: false } }),
     fail: (code, text) => hook({ ...base, hook_event_name: 'PostToolUseFailure', duration_ms: 900, error: `Exit code ${code}\n${text}` }),
+    // The call returns at once and the process runs on, writing to outputFile.
+    toBackground: (taskId, outputFile) => hook({ ...base, hook_event_name: 'PostToolUse', duration_ms: 50, tool_response: { stdout: '', stderr: '', backgroundTaskId: taskId, outputFile } }),
   };
 }
 
@@ -150,6 +152,24 @@ exports.run = async function run() {
     check('the finished command\'s tab was closed', !terminals().includes('Claude: npm test') || active() === 'Claude: npm test', `terminals: ${JSON.stringify(terminals())}, active: ${active()}`);
     shot('4-panel-stays-closed');
     e2e.end('3 passed', 7000);
+    await wait(1200);
+
+    // A background process: its tab stays while it runs, and goes once it has ended and something else opens.
+    const taskOutput = path.join(OUT, 'background-task.output');
+    fs.writeFileSync(taskOutput, 'watching for changes…\n');
+    const watcher = tool(S1, 'npm run build:watch', { input: { run_in_background: true } });
+    watcher.start();
+    watcher.toBackground('bgtest1', taskOutput);
+    await wait(2000);
+    check('a background process gets a tab', terminals().includes('Claude: npm run build:watch'), JSON.stringify(terminals()));
+    fs.appendFileSync(taskOutput, 'done\n[exited with code 0]\n'); // the process ends
+    await wait(3500);
+    const typecheck = tool(S1, 'npm run typecheck');
+    typecheck.start();
+    await wait(4000);
+    check("the ended background process's tab is closed when the next tab opens", !terminals().includes('Claude: npm run build:watch'), JSON.stringify(terminals()));
+    check('finished tabs do not pile up', terminals().filter((n) => n.startsWith('Claude: ')).length <= 2, JSON.stringify(terminals()));
+    typecheck.end('no errors', 6000);
     await wait(1200);
 
     // Claude asks for permission.

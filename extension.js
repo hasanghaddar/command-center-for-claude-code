@@ -47,11 +47,18 @@ const plain = (s) => String(s || '').replace(/[^A-Za-z0-9]/g, '').toLowerCase();
 // Identifies a file as it is now: changes when it is replaced or rewritten.
 function fileId(file) {
   try {
-    const st = fs.statSync(file);
-    return `${st.ino}:${st.size}:${st.mtimeMs}`;
+    const st = fs.statSync(file, { bigint: true });
+    return `${st.ino}:${st.size}:${st.mtimeNs}`;
   } catch {
     return '';
   }
+}
+
+// A file's size and which file it is. The identity is read as a BigInt: as a
+// number, NTFS identities lose their last digits and different files can look the same.
+function sizeAndIdentity(file) {
+  const st = fs.statSync(file, { bigint: true });
+  return { size: Number(st.size), ino: String(st.ino) };
 }
 
 // What a record learns while the window runs, kept when the history is read again.
@@ -375,9 +382,7 @@ class Store {
     let size = -1;
     let ino;
     try {
-      const st = fs.statSync(this.file);
-      size = st.size;
-      ino = st.ino;
+      ({ size, ino } = sizeAndIdentity(this.file));
     } catch {}
     if (this.offset > 0 && (size < this.offset || ino !== this.ino)) {
       // Not the file that was being read: the hook moved it to events.jsonl.1
@@ -399,7 +404,7 @@ class Store {
     const older = this.file + '.1';
     let st;
     try {
-      st = fs.statSync(older);
+      st = sizeAndIdentity(older);
     } catch {
       return false;
     }
@@ -1509,6 +1514,7 @@ class TerminalManager {
     this.following = true;
     this.pending = new Map(); // record id -> timer that opens its tab if it is still running
     this.selfClosedAt = 0; // when closeFinished last closed the tab that was showing
+    this.pickAfterMs = 1500; // a tab becoming active sooner after it opened wasn't picked by the user
     this.activeSub = vscode.window.onDidChangeActiveTerminal((t) => {
       const ours = !t || this.isOurs(t);
       // Closing our own tab makes VS Code fall back to another terminal; that isn't the user's choice.
@@ -1516,13 +1522,20 @@ class TerminalManager {
       this.following = ours;
       // A tab the user picked in the terminal list (not one that only just opened).
       for (const rt of this.terminals.values()) {
-        if (rt.terminal === t && !rt.seen && Date.now() - rt.createdAt > 1500) this.sawTab(rt);
+        if (rt.terminal === t && !rt.seen && Date.now() - rt.createdAt >= this.pickAfterMs) this.sawTab(rt);
       }
     });
     store.onRecord(({ rec, type }) => {
       if (rec.liveFile && rec.status !== 'running') this.liveClaims.delete(rec.liveFile);
       const t = this.terminals.get(rec.id);
-      if (t) t.update();
+      if (t) {
+        t.rec = rec;
+        t.update();
+      }
+      // A command or background process has ended: of the finished ones' tabs, only the latest stays.
+      if (type !== 'start' && rec.status !== 'running' && rec.status !== 'background' && this.terminals.size) {
+        this.closeFinished({ keepRead: true, keepLatest: true });
+      }
       if (!store.inScope(rec)) return;
       if (type === 'url') return announceUrl(store, rec, this.memento);
       if (this.feed) this.feed.event(rec, type);
@@ -1534,7 +1547,7 @@ class TerminalManager {
           this.pending.delete(rec.id);
           if (rec.status !== 'running') return;
           // Opening quietly: the tab the user is reading is left alone.
-          this.closeFinished(!config.get('revealTabs'));
+          this.closeFinished({ keepRead: !config.get('revealTabs') });
           this.open(rec, true);
         };
         if (delay) this.pending.set(rec.id, setTimeout(openNow, Math.max(0, rec.startTs + delay - Date.now())));
@@ -1544,6 +1557,7 @@ class TerminalManager {
         this.pending.delete(rec.id);
       }
       if (type === 'end' && rec.status === 'background' && config.get('autoOpenBackground')) {
+        this.closeFinished({ keepRead: !config.get('revealTabs') });
         this.open(rec, true);
       }
     });
@@ -1626,17 +1640,31 @@ class TerminalManager {
     return (rec.liveFile = best.f);
   }
 
-  // Close auto-opened tabs of foreground commands that have finished; they
-  // can be reopened from the dashboard or the Commands view.
-  closeFinished(keepActive = false) {
-    for (const t of [...this.terminals.values()]) {
-      // A command moved to the background mid-run is still going; keep it.
-      if (t.auto && !t.shared && !t.rec.background && t.rec.status !== 'running' && t.rec.status !== 'background') {
-        const active = t.terminal === vscode.window.activeTerminal;
-        if (active && keepActive) continue;
-        if (active) this.selfClosedAt = Date.now();
-        t.dispose();
-      }
+  // Close auto-opened tabs of commands that have finished, a background
+  // process that has ended included (one still going keeps its tab). They can
+  // be reopened from the dashboard or the Commands view.
+  // keepRead: not the one in front of the user, if they picked it.
+  // keepLatest: nor the one that finished last, so what Claude just ran can still be looked at.
+  closeFinished({ keepRead = false, keepLatest = false } = {}) {
+    const finished = [...this.terminals.values()].filter((t) => t.auto && !t.shared && t.rec.status !== 'running' && t.rec.status !== 'background');
+    const latest = keepLatest ? finished.reduce((a, t) => (!a || (t.rec.endTs || 0) >= (a.rec.endTs || 0) ? t : a), null) : null;
+    for (const t of finished) {
+      const active = t.terminal === vscode.window.activeTerminal;
+      if (t === latest || (keepRead && active && t.seen)) continue;
+      if (active) this.selfClosedAt = Date.now();
+      t.dispose();
+    }
+  }
+
+  // Tabs left by an earlier run of this extension: when it is updated, or its
+  // host restarts, the tabs it had open stay in the terminal list with
+  // nothing writing to them and nothing to close them. They have no process
+  // behind them, unlike a session resumed in a terminal, whose name is alike.
+  async closeLeftovers() {
+    for (const t of [...vscode.window.terminals]) {
+      if (!/^Claude: /.test(t.name) || this.isOurs(t)) continue;
+      const pid = await Promise.race([t.processId, new Promise((resolve) => setTimeout(() => resolve(null), 3000))]);
+      if ((pid === -1 || pid === undefined) && !this.isOurs(t)) t.dispose();
     }
   }
 
@@ -2962,6 +2990,7 @@ function activate(context) {
   const provider = new Provider(store, index);
   const terminals = new TerminalManager(store);
   terminals.memento = context.workspaceState;
+  terminals.closeLeftovers();
 
   const view = vscode.window.createTreeView('claudeCommandCenter.commands', { treeDataProvider: provider });
   const monitor = new ResourceMonitor(store, terminals, view, provider);

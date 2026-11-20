@@ -44,7 +44,7 @@ function setActiveTerminal(t) {
 
 // A terminal the user opened themselves.
 function userTerminal(name = 'powershell') {
-  const t = { name };
+  const t = { name, processId: Promise.resolve(4242) };
   state.terminals.push(t);
   return t;
 }
@@ -52,6 +52,7 @@ function userTerminal(name = 'powershell') {
 function createTerminal(opts) {
   const t = {
     name: opts.name,
+    processId: Promise.resolve(-1), // an extension's own tab has no process
     output: '',
     disposed: false,
     show() {
@@ -91,6 +92,9 @@ const message = (text) => {
 };
 
 const windowApi = {
+  get terminals() {
+    return state.terminals.filter((t) => !t.disposed);
+  },
   get activeTerminal() {
     return state.activeTerminal;
   },
