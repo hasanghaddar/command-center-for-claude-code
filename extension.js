@@ -9,9 +9,13 @@ const { Dashboard, folderLabel } = require('./dashboard');
 const hookSetup = require('./hook-setup');
 const setupCheck = require('./setup-check');
 const sessions = require('./sessions');
-const { findTaskPids, killTree, listProcesses, matchTaskProcesses, processTree } = require('./processes');
+const { findTaskPids, killTree, listProcesses, matchTaskProcesses, processTree, closeSession: closeProcessSession } = require('./processes');
 const { TranscriptViews } = require('./transcript-view');
 const { searchTranscripts } = require('./transcript');
+const history = require('./history');
+const notifyOs = require('./notify-os');
+const grouping = require('./grouping');
+const cp = require('child_process');
 
 const ESC = '\x1b[';
 const c = {
@@ -35,7 +39,23 @@ const DEFAULT_TOOL_TIMEOUT = 2 * 60 * 1000;
 const MAX_TOOL_TIMEOUT = 10 * 60 * 1000;
 const NO_RESULT_GRACE = 60 * 1000;
 
-const SESSION_EVENT_TYPES = new Set(['turnEnd', 'subagentStart', 'subagentEnd', 'attention']);
+const SESSION_EVENT_TYPES = new Set(['prompt', 'turnEnd', 'subagentStart', 'subagentEnd', 'attention']);
+
+// Letters and digits only, to compare commands however they are quoted.
+const plain = (s) => String(s || '').replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+
+// Identifies a file as it is now: changes when it is replaced or rewritten.
+function fileId(file) {
+  try {
+    const st = fs.statSync(file);
+    return `${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return '';
+  }
+}
+
+// What a record learns while the window runs, kept when the history is read again.
+const RUNTIME_FIELDS = ['liveFile', 'usage', 'peakMem', 'url', 'urlOffset', 'outputFile', 'orphanChecked'];
 
 // Comparable path: forward slashes, no trailing slash, case-insensitive on Windows.
 function normPath(p) {
@@ -67,6 +87,17 @@ function formatDuration(ms) {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
+// Whole seconds, for a figure that ticks in the status bar: "8s", "2m 05s".
+function formatSeconds(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${String(s % 60).padStart(2, '0')}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// How long a command runs before the status bar names it, so quick ones don't flicker there.
+const STATUS_NAME_AFTER_MS = 2000;
+
 function formatBytes(n) {
   if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
   return `${Math.round(n / 1024 ** 2)} MB`;
@@ -95,12 +126,21 @@ function isAlive(pid) {
 // Store: tails events.jsonl and keeps one record per tool call.
 // ---------------------------------------------------------------------------
 
+// A background task is checked for having ended with its Claude Code session
+// once it has run, and its output has been quiet, for this long.
+const ORPHAN_QUIET_MS = 2 * 60 * 1000;
+const ORPHAN_RECHECK_MS = 10 * 60 * 1000; // one found still running is looked at again after this
+
 class Store {
-  constructor() {
+  // deps (for the tests): liveSessions() and listProcesses()
+  constructor(deps = {}) {
+    this.deps = { liveSessions: sessions.liveSessions, listProcesses, ...deps };
     this.records = new Map();
     this.changes = new Map(); // file edits, keyed by tool_use_id
     this.earlyEnds = new Map(); // end events seen before their start
     this.turnEnds = new Map(); // session -> times its turns ended
+    this.turnStarts = new Map(); // session -> when its latest prompt was sent
+    this.background = new Map(); // session -> its records that went to the background
     this.offset = 0;
     this.partial = '';
     this._onChange = new vscode.EventEmitter();
@@ -118,16 +158,141 @@ class Store {
 
   start() {
     this.startedAt = Date.now();
-    this.read();
-    this.initialLoad = false;
-    this.checkFinished();
+    this.load();
     this.timer = setInterval(() => this.read(), 700);
     this.finishTimer = setInterval(() => this.checkFinished(), 2000);
+    this.orphanTimer = setInterval(() => this.sweepOrphans(), 30 * 1000);
+    // Soon after startup, at a different moment in each window.
+    this.orphanFirst = setTimeout(() => this.sweepOrphans(), 5000 + Math.random() * 10000);
   }
 
   dispose() {
     clearInterval(this.timer);
     clearInterval(this.finishTimer);
+    clearInterval(this.orphanTimer);
+    clearTimeout(this.orphanFirst);
+  }
+
+  // Everything on disk: the file the hook last moved aside (events.jsonl.1),
+  // then the current one. Nothing is announced as new.
+  load() {
+    this.initialLoad = true;
+    this.olderId = fileId(this.file + '.1');
+    try {
+      this.applyChunk(fs.readFileSync(this.file + '.1', 'utf8') + '\n');
+    } catch {}
+    this.partial = '';
+    this.read();
+    this.initialLoad = false;
+    this.checkFinished();
+  }
+
+  // Forget everything and read it again: the Refresh button, and whenever the
+  // files were replaced (cleared, or rewritten by history.js). A command or
+  // change that is still there afterwards stays the same object, so a tab or
+  // view that is showing it carries on.
+  reload() {
+    this.previous = { records: this.records, changes: this.changes };
+    this.reset();
+    this.load();
+    this.previous = null;
+  }
+
+  // `fresh` as the record with this id from before the reload, if there was one.
+  reuse(kind, id, fresh) {
+    const old = this.previous && this.previous[kind].get(id);
+    if (!old) return fresh;
+    const learned = {};
+    for (const k of RUNTIME_FIELDS) if (old[k] !== undefined) learned[k] = old[k];
+    for (const k of Object.keys(old)) delete old[k];
+    return Object.assign(old, fresh, learned);
+  }
+
+  // history.js is rewriting the files (it holds this lock for a second or two).
+  maintenanceBusy() {
+    try {
+      return Date.now() - fs.statSync(path.join(logDir(), 'maintenance.lock')).mtimeMs < 2 * 60 * 1000;
+    } catch {
+      return false;
+    }
+  }
+
+  // A turn or a subagent ended, and Claude Code listed the background tasks
+  // still going (ev.tasks). One of this session's that isn't listed has ended:
+  // it is marked, and checkFinished finishes it (with its exit code, if its
+  // output file has one). A task is matched by its id; that the ids are the
+  // same on both sides isn't documented, so nothing is concluded from a
+  // missing id until one has been seen to match. Watchers have no id here and
+  // are matched by their command; if the list has a command this can't place,
+  // no watcher is ended.
+  reconcileTasks(ev) {
+    const mine = this.background.get(ev.session);
+    if (!mine) return;
+    const ids = new Set(ev.tasks.map((t) => t.id).filter(Boolean));
+    const commands = ev.tasks.filter((t) => t.command).map((t) => plain(t.command));
+    const sameCommand = (rec) => commands.findIndex((c) => c.length >= 4 && plain(rec.command).startsWith(c));
+    const unplaced = [];
+    for (const rec of [...mine]) {
+      if (rec.status !== 'background') {
+        mine.delete(rec);
+        continue;
+      }
+      if (rec.startTs >= ev.ts || rec.endedHint) continue;
+      if (rec.backgroundTaskId && ids.has(rec.backgroundTaskId)) {
+        this.taskIdsMatch = true;
+        const at = sameCommand(rec);
+        if (at >= 0) commands.splice(at, 1);
+        continue;
+      }
+      const at = sameCommand(rec);
+      if (at >= 0) commands.splice(at, 1); // still listed
+      else unplaced.push(rec);
+    }
+    for (const rec of unplaced) {
+      if (rec.backgroundTaskId ? this.taskIdsMatch : !commands.length) rec.endedHint = ev.ts;
+    }
+  }
+
+  // A background task leaves no exit marker when the Claude Code process that
+  // started it is gone, so it would stay "background" for good. For tasks
+  // whose process has ended (or was restarted since) and whose output has gone
+  // quiet, look for the task's own process once; without one, it has ended.
+  async sweepOrphans() {
+    if (this.sweeping) return;
+    const now = Date.now();
+    let live = null;
+    const suspects = [];
+    for (const rec of this.records.values()) {
+      if (rec.status !== 'background' || now - rec.startTs < ORPHAN_QUIET_MS) continue;
+      if (now - (rec.orphanChecked || 0) < ORPHAN_RECHECK_MS) continue;
+      let quietSince = 0;
+      try {
+        quietSince = fs.statSync(rec.outputFile).mtimeMs;
+      } catch {}
+      if (now - quietSince < ORPHAN_QUIET_MS) continue;
+      live = live || this.deps.liveSessions();
+      const owner = live.get(rec.session);
+      if (owner && !(owner.startedAt > rec.startTs)) continue; // its Claude Code process is still there
+      suspects.push({ rec, quietSince });
+    }
+    if (!suspects.length) return;
+    this.sweeping = true;
+    try {
+      const procs = await this.deps.listProcesses();
+      if (!procs.length) return; // the process list couldn't be read: nothing is known
+      this.read(); // another window may have dealt with them meanwhile
+      let ended = 0;
+      for (const { rec, quietSince } of suspects) {
+        rec.orphanChecked = Date.now();
+        if (rec.status !== 'background') continue;
+        if (matchTaskProcesses(procs, rec).length) continue; // still running on its own
+        appendEvent({ id: rec.id, type: 'stopped', ts: quietSince || rec.endTs || rec.startTs, reason: 'sessionEnded' });
+        ended++;
+      }
+      if (ended) this.read();
+    } finally {
+      this.sweeping = false;
+    }
   }
 
   // No hook fires when a background task ends, but Claude Code appends
@@ -137,6 +302,7 @@ class Store {
   // so past that it is marked "no result".
   checkFinished() {
     let changed = false;
+    const exited = [];
     const now = Date.now();
     for (const rec of this.records.values()) {
       if (rec.status === 'running' && !rec.background) {
@@ -149,51 +315,105 @@ class Store {
         continue;
       }
       if (rec.status !== 'background') continue;
+      if (rec.monitor) {
+        // Ended when Claude Code no longer lists it (reconcileTasks). It can't
+        // outlive its timeout either; one without ends with its session (sweepOrphans).
+        const timedOut = rec.timeout && now - rec.startTs > rec.timeout;
+        if (rec.endedHint || timedOut) {
+          rec.status = 'stopped';
+          rec.endTs = rec.endedHint || rec.startTs + rec.timeout;
+          rec.endReason = 'monitorEnded';
+          changed = true;
+          this._onRecord.fire({ rec, type: 'end' });
+        }
+        continue;
+      }
       if (!rec.outputFile) rec.outputFile = findTaskOutput(rec.session, rec.backgroundTaskId);
-      if (!rec.outputFile) continue;
-      if (!rec.url && (rec.url = scanForUrl(rec))) {
+      if (rec.outputFile && !rec.url && (rec.url = scanForUrl(rec))) {
         changed = true;
         this._onRecord.fire({ rec, type: 'url' });
       }
-      const exit = readExitMarker(rec.outputFile);
-      if (!exit) continue;
+      const exit = rec.outputFile ? readExitMarker(rec.outputFile) : null;
+      if (!exit) {
+        // No exit code to read, but Claude Code no longer lists the task (reconcileTasks).
+        if (rec.endedHint) {
+          rec.status = 'stopped';
+          rec.endTs = rec.endedHint;
+          rec.endReason = 'taskEnded';
+          changed = true;
+          this._onRecord.fire({ rec, type: 'end' });
+        }
+        continue;
+      }
       rec.exitCode = exit.code;
       rec.endTs = exit.mtime;
       rec.status = exit.code === 0 ? 'ok' : exit.code == null ? 'stopped' : 'failed';
       changed = true;
       this._onRecord.fire({ rec, type: 'end' });
+      // Written down so it is known from the log from now on: without this,
+      // every window would look for every past task's output file at each start.
+      exited.push({ id: rec.id, type: 'exited', ts: exit.mtime, exitCode: exit.code });
     }
+    if (exited.length) appendEvent(...exited);
     if (changed) this._onChange.fire();
   }
 
   reset() {
-    this.records.clear();
-    this.changes.clear();
+    this.records = new Map();
+    this.changes = new Map();
     this.earlyEnds.clear();
     this.turnEnds.clear();
+    this.turnStarts.clear();
+    this.background.clear();
     this.offset = 0;
     this.partial = '';
     this._onChange.fire();
   }
 
   read() {
-    let size;
+    if (!this.initialLoad && this.maintenanceBusy()) return; // read again once it is done
+    let size = -1;
+    let ino;
     try {
-      size = fs.statSync(this.file).size;
-    } catch {
-      if (this.records.size) this.reset();
-      return;
+      const st = fs.statSync(this.file);
+      size = st.size;
+      ino = st.ino;
+    } catch {}
+    if (this.offset > 0 && (size < this.offset || ino !== this.ino)) {
+      // Not the file that was being read: the hook moved it to events.jsonl.1
+      // (it does at 20 MB) and started a new one, or the history was cleared
+      // or rewritten.
+      if (!this.followRotation()) return this.reload();
+    } else if (!this.initialLoad && fileId(this.file + '.1') !== this.olderId) {
+      return this.reload(); // the older history was rewritten or removed
     }
-    if (size < this.offset) this.reset(); // rotated or cleared
-    if (size === this.offset) return;
-
-    const fd = fs.openSync(this.file, 'r');
-    const buf = Buffer.alloc(size - this.offset);
-    fs.readSync(fd, buf, 0, buf.length, this.offset);
-    fs.closeSync(fd);
+    this.ino = ino;
+    if (size <= this.offset) return;
+    if (this.applyChunk(readBytes(this.file, this.offset, size - this.offset))) this._onChange.fire();
     this.offset = size;
+  }
 
-    const lines = (this.partial + buf.toString('utf8')).split('\n');
+  // After a rotation: read what was still added to the old file, then start
+  // on the new one, keeping what is loaded. False if it wasn't a rotation.
+  followRotation() {
+    const older = this.file + '.1';
+    let st;
+    try {
+      st = fs.statSync(older);
+    } catch {
+      return false;
+    }
+    if (st.ino !== this.ino || st.size < this.offset) return false;
+    if (st.size > this.offset && this.applyChunk(readBytes(older, this.offset, st.size - this.offset))) this._onChange.fire();
+    this.offset = 0;
+    this.partial = '';
+    this.olderId = fileId(older);
+    return true;
+  }
+
+  // Apply the complete lines in `text`; an unfinished last line waits for the rest.
+  applyChunk(text) {
+    const lines = (this.partial + text).split('\n');
     this.partial = lines.pop();
     let changed = false;
     for (const line of lines) {
@@ -203,13 +423,13 @@ class Store {
         changed = true;
       } catch {}
     }
-    if (changed) this._onChange.fire();
+    return changed;
   }
 
   applyFile(ev) {
     let ch = this.changes.get(ev.id);
     if (ev.type === 'fileStart') {
-      ch = {
+      ch = this.reuse('changes', ev.id, {
         id: ev.id,
         kind: 'change',
         session: ev.session,
@@ -227,7 +447,7 @@ class Store {
         newString: ev.newString,
         replaceAll: ev.replaceAll,
         edits: ev.edits,
-      };
+      });
       this.changes.set(ev.id, ch);
       const early = this.earlyEnds.get('file:' + ev.id);
       if (early) {
@@ -252,10 +472,12 @@ class Store {
   apply(ev) {
     if (ev.type === 'fileStart' || ev.type === 'fileEnd') return this.applyFile(ev);
     if (SESSION_EVENT_TYPES.has(ev.type)) {
+      if (ev.type === 'prompt' && ev.session) this.turnStarts.set(ev.session, ev.ts);
       if (ev.type === 'turnEnd' && ev.session) {
         if (!this.turnEnds.has(ev.session)) this.turnEnds.set(ev.session, []);
         this.turnEnds.get(ev.session).push(ev.ts);
       }
+      if ((ev.type === 'turnEnd' || ev.type === 'subagentEnd') && Array.isArray(ev.tasks)) this.reconcileTasks(ev);
       if (!this.initialLoad) this._onSessionEvent.fire(ev);
       return;
     }
@@ -270,20 +492,24 @@ class Store {
     id = id || `${ev.session}:${ev.ts}`;
     let rec = this.records.get(id);
     if (ev.type === 'start') {
-      rec = {
+      rec = this.reuse('records', id, {
         id,
         session: ev.session,
         tool: ev.tool,
         command: ev.command || '',
         description: ev.description || '',
         cwd: ev.cwd,
-        background: ev.background,
+        // A watcher started with Claude's Monitor tool runs in the background
+        // from the start, and no hook reports its end (see checkFinished).
+        background: ev.background || !!ev.monitor,
+        monitor: !!ev.monitor,
         timeout: ev.timeout,
         startTs: ev.ts,
-        status: 'running',
+        status: ev.monitor ? 'background' : 'running',
         output: '',
-      };
+      });
       this.records.set(id, rec);
+      if (rec.monitor) this.wentBackground(rec);
       const early = this.earlyEnds.get(id);
       if (early) {
         this.earlyEnds.delete(id);
@@ -302,8 +528,10 @@ class Store {
       rec.exitCode = ev.exitCode;
       if (ev.backgroundTaskId) {
         rec.backgroundTaskId = ev.backgroundTaskId;
-        rec.outputFile = ev.outputFile || findTaskOutput(rec.session, ev.backgroundTaskId);
+        // Looked up when it is needed (checkFinished): at startup that is only for tasks still running.
+        rec.outputFile = ev.outputFile || rec.outputFile || (this.initialLoad ? undefined : findTaskOutput(rec.session, ev.backgroundTaskId));
         rec.status = 'background';
+        this.wentBackground(rec);
       } else if (ev.failed || ev.interrupted || (ev.exitCode != null && ev.exitCode !== 0)) {
         rec.status = ev.interrupted ? 'interrupted' : 'failed';
       } else {
@@ -313,11 +541,26 @@ class Store {
       if (rec && (rec.status === 'background' || rec.status === 'stopped')) {
         rec.status = 'stopped';
         rec.endTs = ev.ts;
+        rec.endReason = ev.reason; // 'sessionEnded': see sweepOrphans
       }
+    } else if (ev.type === 'exited') {
+      // A background task's exit, written down by the window that noticed it (checkFinished).
+      if (!rec || rec.status !== 'background') return;
+      rec.exitCode = ev.exitCode;
+      rec.endTs = ev.ts;
+      rec.status = ev.exitCode === 0 ? 'ok' : ev.exitCode == null ? 'stopped' : 'failed';
+      if (!this.initialLoad) this._onRecord.fire({ rec, type: 'end' });
+      return;
     } else {
       return;
     }
     if (!this.initialLoad) this._onRecord.fire({ rec, type: ev.type });
+  }
+
+  wentBackground(rec) {
+    if (!rec.session) return;
+    if (!this.background.has(rec.session)) this.background.set(rec.session, new Set());
+    this.background.get(rec.session).add(rec);
   }
 
   setScope(scope) {
@@ -356,9 +599,19 @@ class Store {
     return n;
   }
 
+  // Regular commands running right now, the latest first.
+  runningForeground() {
+    return [...this.records.values()]
+      .filter((r) => r.status === 'running' && !r.background && this.inScope(r))
+      .sort((a, b) => b.startTs - a.startTs);
+  }
+
   clear() {
     try {
       fs.writeFileSync(this.file, '');
+    } catch {}
+    try {
+      fs.unlinkSync(this.file + '.1'); // the history moved aside at 20 MB
     } catch {}
     for (const sub of ['snapshots', 'reverts', 'context']) {
       try {
@@ -366,6 +619,16 @@ class Store {
       } catch {}
     }
     this.reset();
+  }
+}
+
+function readBytes(file, start, length) {
+  const buf = Buffer.alloc(length);
+  const fd = fs.openSync(file, 'r');
+  try {
+    return buf.toString('utf8', 0, fs.readSync(fd, buf, 0, length, start));
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -658,8 +921,24 @@ function writeCommandContext(rec) {
 // <tmp>/claude/<project>/<session>/tasks/<taskId>.output
 // A session's task folder, where Claude Code writes each command's output
 // while it runs: <root>/<project>/<session>/tasks.
+// Finding them means listing folders, and callers ask again every second or
+// two, so the answer is kept for a while: a minute once found, two seconds
+// while there is none (a session that hasn't run anything yet, or an old one
+// whose folder is gone).
+const tasksDirsCache = new Map(); // session -> { dirs, until }
+
 function findTasksDirs(session) {
   if (!session) return [];
+  const now = Date.now();
+  const cached = tasksDirsCache.get(session);
+  if (cached && now < cached.until) return cached.dirs;
+  const dirs = scanTasksDirs(session);
+  if (tasksDirsCache.size > 500) tasksDirsCache.clear();
+  tasksDirsCache.set(session, { dirs, until: now + (dirs.length ? 60 * 1000 : 2000) });
+  return dirs;
+}
+
+function scanTasksDirs(session) {
   // <tmp>/claude on Windows; <tmp>/claude-<uid> on macOS and Linux, where
   // <tmp> is CLAUDE_CODE_TMPDIR, else /tmp (Node's tmpdir() can differ).
   const uid = process.getuid ? process.getuid() : '';
@@ -679,6 +958,26 @@ function findTasksDirs(session) {
     }
   }
   return dirs;
+}
+
+// Whether a command of this session started writing its output after `ts`.
+function outputStartedAfter(session, ts) {
+  for (const dir of findTasksDirs(session)) {
+    let names;
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!n.endsWith('.output')) continue;
+      try {
+        const st = fs.statSync(path.join(dir, n));
+        if ((st.birthtimeMs || st.ctimeMs) > ts) return true;
+      } catch {}
+    }
+  }
+  return false;
 }
 
 function findTaskOutput(session, taskId) {
@@ -744,15 +1043,20 @@ const STATUS_ICON = {
   stopped: new vscode.ThemeIcon('debug-stop', new vscode.ThemeColor('disabledForeground')),
 };
 
+// The Commands view shows commands under the session that ran them, with runs
+// of quick, successful ones folded into one row (grouping.js, shared with the dashboard).
+const { groupBySession, foldQuick } = grouping;
+
 class Provider {
-  constructor(store) {
+  constructor(store, index) {
     this.store = store;
+    this.index = index;
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
     store.onChange(() => this._onDidChangeTreeData.fire());
     // keep "running for Xs" labels fresh
     this.ticker = setInterval(() => {
-      if (store.runningCount()) this._onDidChangeTreeData.fire();
+      if (store.runningForeground().length) this._onDidChangeTreeData.fire();
     }, 5000);
   }
 
@@ -765,10 +1069,52 @@ class Provider {
   }
 
   getChildren(el) {
-    return el ? [] : this.store.list();
+    if (el) return el.kind === 'session' ? foldQuick(el.records) : el.kind === 'quick' ? el.records : [];
+    const list = this.store.list();
+    return vscode.workspace.getConfiguration('claudeCommandCenter').get('commandList') === 'flat' ? list : groupBySession(list);
   }
 
-  getTreeItem(rec) {
+  getTreeItem(el) {
+    if (el.kind === 'session') return this.sessionItem(el);
+    if (el.kind === 'quick') return this.quickItem(el);
+    return this.commandItem(el);
+  }
+
+  sessionItem(group) {
+    const s = this.index && this.index.get(group.id);
+    const label = s ? sessionLabel(s) : group.id ? `Session ${group.id.slice(0, 8)}` : 'Other commands';
+    const item = new vscode.TreeItem(label, group.first ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
+    item.id = 'cmdsession:' + group.id;
+    const count = (status) => group.records.filter((r) => r.status === status).length;
+    const running = count('running') + count('background');
+    const failed = count('failed');
+    item.iconPath = running ? SESSION_ICON.busy : SESSION_ICON[s && s.live ? 'idle' : 'closed'];
+    item.description = [
+      running ? `${running} running` : '',
+      failed ? `${failed} failed` : '',
+      `${group.records.length} command${group.records.length === 1 ? '' : 's'}`,
+      formatWhen(group.records[0].startTs),
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    const project = (s && s.cwd) || group.records[0].cwd;
+    item.tooltip = [label, project, s ? (s.live ? 'Open in Claude Code' : 'Closed') : ''].filter(Boolean).join('\n');
+    item.contextValue = group.id ? 'cmdSession' : 'cmdOther';
+    return item;
+  }
+
+  quickItem(group) {
+    const item = new vscode.TreeItem(`${group.records.length} quick commands`, vscode.TreeItemCollapsibleState.Collapsed);
+    item.id = 'cmdquick:' + group.id;
+    item.iconPath = new vscode.ThemeIcon('check-all', new vscode.ThemeColor('disabledForeground'));
+    const names = group.records.slice(0, 3).map((r) => commandLabel(r).slice(0, 30));
+    item.description = names.join(', ') + (group.records.length > 3 ? ', …' : '');
+    item.tooltip = 'Commands that finished without an error in under 2 seconds. Expand to see them.';
+    item.contextValue = 'cmdQuick';
+    return item;
+  }
+
+  commandItem(rec) {
     const label = commandLabel(rec);
     const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
     item.id = rec.id;
@@ -778,7 +1124,7 @@ class Provider {
     const elapsed = (rec.endTs || Date.now()) - rec.startTs;
     let when;
     if (rec.status === 'running') when = `running ${formatDuration(elapsed)}`;
-    else if (rec.status === 'background') when = `${rec.url ? rec.url.replace(/^https?:\/\//, '') : 'background'} · ${formatTime(rec.startTs)}`;
+    else if (rec.status === 'background') when = `${rec.url ? rec.url.replace(/^https?:\/\//, '') : rec.monitor ? 'watching' : 'background'} · ${formatTime(rec.startTs)}`;
     else when = `${formatDuration(elapsed)} · ${formatTime(rec.startTs)}`;
     // Usage is shown while running, and only if sampled recently.
     const live = rec.status === 'running' || rec.status === 'background';
@@ -827,7 +1173,7 @@ function footer(rec) {
     case 'interrupted':
       return crlf(`\n${c.yellow(`⊘ interrupted after ${dur}`)}${peak}\n`);
     case 'stopped':
-      return crlf(`\n${c.yellow('■ stopped')}\n`);
+      return crlf(`\n${c.yellow(rec.endReason === 'sessionEnded' ? '■ ended with its Claude Code session' : rec.endReason === 'monitorEnded' ? '■ ended' : '■ stopped')}\n`);
     case 'noresult':
       return crlf(`\n${c.yellow('… no result: the command was denied, cancelled or interrupted')}\n`);
     default:
@@ -900,6 +1246,7 @@ class RecordTerminal {
     this.rec = rec;
     this.tailOffset = 0;
     this.wroteResult = false;
+    this.createdAt = Date.now();
     this.name = `Claude: ${commandLabel(rec).slice(0, 40)}`;
     if (shared) {
       this.shared = shared;
@@ -975,7 +1322,12 @@ class RecordTerminal {
         this.write(resultText(rec));
       }
     }
-    if (rec.background) {
+    if (rec.monitor) {
+      if (!this.wroteNoFile) {
+        this.wroteNoFile = true;
+        this.write(c.dim(crlf('Claude is watching this with its Monitor tool. What it prints goes to Claude and isn’t recorded here.\n')));
+      }
+    } else if (rec.background) {
       if (!rec.outputFile) rec.outputFile = findTaskOutput(rec.session, rec.backgroundTaskId);
       if (rec.outputFile) this.startTail();
       else if (!this.wroteNoFile) {
@@ -1090,12 +1442,14 @@ class RecordTerminal {
   }
 
   show() {
+    this.manager.sawTab(this);
     this.terminal.show(true);
   }
 
   dispose(fromClose) {
     clearInterval(this.tailTimer);
     clearInterval(this.liveTimer);
+    if (this.manager.preview === this) this.manager.preview = null;
     this.manager.terminals.delete(this.rec.id);
     if (!fromClose && !this.shared) this.terminal.dispose();
   }
@@ -1145,9 +1499,13 @@ class TerminalManager {
     this.liveClaims = new Set(); // output files of running foreground commands
     this.feed = null;
     this.shared = null; // the SharedTerminal, once a command has used it
-    // Whether tabs opened for Claude's commands come to the front. Turned off
-    // when the user switches to a terminal of their own (so their typing isn't
-    // interrupted) and back on when they select one of Claude's tabs.
+    this.preview = null; // the finished command's tab the user last opened; the next one replaces it
+    this._onSawTab = new vscode.EventEmitter();
+    this.onSawTab = this._onSawTab.event; // a command's tab was brought in front of the user
+    // With claudeCommandCenter.revealTabs on: whether tabs opened for Claude's
+    // commands come to the front. Turned off when the user switches to a
+    // terminal of their own (so their typing isn't interrupted) and back on
+    // when they select one of Claude's tabs.
     this.following = true;
     this.pending = new Map(); // record id -> timer that opens its tab if it is still running
     this.selfClosedAt = 0; // when closeFinished last closed the tab that was showing
@@ -1156,13 +1514,17 @@ class TerminalManager {
       // Closing our own tab makes VS Code fall back to another terminal; that isn't the user's choice.
       if (!ours && Date.now() - this.selfClosedAt < 1000) return;
       this.following = ours;
+      // A tab the user picked in the terminal list (not one that only just opened).
+      for (const rt of this.terminals.values()) {
+        if (rt.terminal === t && !rt.seen && Date.now() - rt.createdAt > 1500) this.sawTab(rt);
+      }
     });
     store.onRecord(({ rec, type }) => {
       if (rec.liveFile && rec.status !== 'running') this.liveClaims.delete(rec.liveFile);
       const t = this.terminals.get(rec.id);
       if (t) t.update();
       if (!store.inScope(rec)) return;
-      if (type === 'url') return announceUrl(store, rec);
+      if (type === 'url') return announceUrl(store, rec, this.memento);
       if (this.feed) this.feed.event(rec, type);
       const config = vscode.workspace.getConfiguration('claudeCommandCenter');
       if (type === 'start' && !rec.background && config.get('autoOpenForeground')) {
@@ -1171,7 +1533,8 @@ class TerminalManager {
         const openNow = () => {
           this.pending.delete(rec.id);
           if (rec.status !== 'running') return;
-          this.closeFinished();
+          // Opening quietly: the tab the user is reading is left alone.
+          this.closeFinished(!config.get('revealTabs'));
           this.open(rec, true);
         };
         if (delay) this.pending.set(rec.id, setTimeout(openNow, Math.max(0, rec.startTs + delay - Date.now())));
@@ -1186,11 +1549,18 @@ class TerminalManager {
     });
   }
 
+  sawTab(rt) {
+    rt.seen = true;
+    this._onSawTab.fire(rt.rec);
+  }
+
   // auto: opened because Claude ran it, not by the user; such tabs of
-  // finished commands are closed when the next command opens.
+  // finished commands are closed when the next command opens. They wait in
+  // the terminal list (the status bar names the running command) unless
+  // claudeCommandCenter.revealTabs is on, so the panel never opens by itself.
   open(rec, auto = false) {
     // Decided before the tab exists: creating it can change the active terminal.
-    const reveal = !auto || this.following;
+    const reveal = !auto || (this.following && !!vscode.workspace.getConfiguration('claudeCommandCenter').get('revealTabs'));
     let t = this.terminals.get(rec.id);
     if (!t) {
       // A running command Claude just started goes to the shared tab, if that is on.
@@ -1204,6 +1574,12 @@ class TerminalManager {
       this.terminals.set(rec.id, t);
     }
     t.auto = auto && t.auto !== false;
+    if (!auto && !t.shared) {
+      // Looking through finished commands reuses one tab instead of leaving one open per command.
+      const old = this.preview;
+      if (old && old !== t && old.rec.status !== 'running' && old.rec.status !== 'background') old.dispose();
+      this.preview = t;
+    }
     if (reveal) t.show(); // otherwise it waits in the terminal list
   }
 
@@ -1252,11 +1628,13 @@ class TerminalManager {
 
   // Close auto-opened tabs of foreground commands that have finished; they
   // can be reopened from the dashboard or the Commands view.
-  closeFinished() {
+  closeFinished(keepActive = false) {
     for (const t of [...this.terminals.values()]) {
       // A command moved to the background mid-run is still going; keep it.
       if (t.auto && !t.shared && !t.rec.background && t.rec.status !== 'running' && t.rec.status !== 'background') {
-        if (t.terminal === vscode.window.activeTerminal) this.selfClosedAt = Date.now();
+        const active = t.terminal === vscode.window.activeTerminal;
+        if (active && keepActive) continue;
+        if (active) this.selfClosedAt = Date.now();
         t.dispose();
       }
     }
@@ -1618,17 +1996,156 @@ const ATTENTION_KINDS = new Set([
   'push_notification',
 ]);
 
+const ATTENTION_STALE_MS = 10 * 60 * 1000;
+
+// Under which application Windows shows a system notification. Other editors
+// built on VS Code aren't known here; theirs appear under "Windows PowerShell".
+const WINDOWS_APP_IDS = {
+  'Visual Studio Code': 'Microsoft.VisualStudioCode',
+  'Visual Studio Code - Insiders': 'Microsoft.VisualStudioCodeInsiders',
+};
+
+// Notifications say what is true when you see them. One raised while the
+// window has no focus is held until it does, and dropped if Claude has moved
+// on by then; a session has at most one, and several sessions share one.
+// While Claude waits for permission or an answer, the status bar says so, and
+// stops saying so once the session carries on.
 class Notifier {
-  constructor(store, index) {
+  // deps (for the tests): systemNotify(notification)
+  constructor(store, index, deps = {}) {
+    this.store = store;
     this.index = index;
+    this.systemNotify = deps.systemNotify || notifyOs.show;
     this.subagents = new Map(); // agent ID -> start time
     this.lastTurnEnd = new Map(); // session -> when its last turn-end toast showed
-    store.onSessionEvent((ev) => this.handle(ev));
+    this.attention = new Map(); // session -> { text, where, s, ts, pending } while Claude waits for the user
+    this.held = new Map(); // key -> notification kept back until the window has focus
+    this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49.8);
+    this.item.command = 'claudeCommandCenter.openWaiting';
+    this.subs = [
+      store.onSessionEvent((ev) => this.handle(ev)),
+      store.onRecord(({ rec, type }) => this.activity(rec, type)),
+      vscode.window.onDidChangeWindowState((w) => w.focused && this.flush()),
+    ];
+    this.timer = setInterval(() => this.attention.size && this.expire(), 3000);
+    if (this.timer.unref) this.timer.unref();
+  }
+
+  dispose() {
+    clearInterval(this.timer);
+    clearTimeout(this.flushTimer);
+    for (const s of this.subs) if (s && s.dispose) s.dispose();
+    this.item.dispose();
   }
 
   wanted(setting) {
     const mode = vscode.workspace.getConfiguration('claudeCommandCenter').get(setting);
     return mode === 'always' || (mode === 'unfocused' && !vscode.window.state.focused);
+  }
+
+  // A command or edit of a session started or ended. The call Claude was
+  // waiting on has finished, or it has started something new: it isn't
+  // waiting any more.
+  activity(rec, type) {
+    if (!rec.session) return;
+    const started = type === 'start' || type === 'fileStart';
+    const ended = type === 'end' || type === 'fileEnd';
+    const ts = rec.startTs || rec.ts || 0;
+    const a = this.attention.get(rec.session);
+    if (a && ((started && ts > a.ts) || (ended && a.pending.has(rec.id)))) this.settle(rec.session);
+    const h = this.held.get(rec.session);
+    if (h && started && ts > h.ts) this.held.delete(rec.session);
+  }
+
+  settle(session) {
+    const h = this.held.get(session);
+    if (h && h.kind === 'attention') this.held.delete(session);
+    if (this.attention.delete(session)) this.render();
+  }
+
+  // No hook says that a permission prompt was answered, so while a session is
+  // waiting this looks for signs that it carried on: its transcript grew, or
+  // a command of its started writing output (the one that was just allowed).
+  // Also drops requests nobody answered here, or whose session has closed.
+  expire() {
+    const now = Date.now();
+    for (const [session, a] of [...this.attention]) {
+      const s = this.index.get(session);
+      const carriedOn = (s && s.lastTs > a.ts + 1000) || outputStartedAfter(session, a.ts);
+      if (carriedOn || now - a.ts > ATTENTION_STALE_MS || (s && !s.live)) this.settle(session);
+    }
+  }
+
+  render() {
+    const list = [...this.attention.values()];
+    if (!list.length) return this.item.hide();
+    this.item.text = `$(bell-dot) Claude needs you${list.length > 1 ? ` (${list.length})` : ''}`;
+    this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    const md = new vscode.MarkdownString('**Claude is waiting for you**\n\n');
+    for (const a of list) {
+      md.appendMarkdown('- ');
+      md.appendText(`${a.where}: ${a.text}`);
+      md.appendMarkdown('\n');
+    }
+    md.appendMarkdown('\nClick to open the session.');
+    this.item.tooltip = md;
+    this.item.show();
+  }
+
+  // The status bar item was clicked.
+  async openWaiting() {
+    const list = [...this.attention.entries()];
+    if (!list.length) return;
+    let chosen = list[0];
+    if (list.length > 1) {
+      const pick = await vscode.window.showQuickPick(
+        list.map((entry) => ({ label: entry[1].where, description: entry[1].text, entry })),
+        { placeHolder: 'Sessions waiting for you' }
+      );
+      if (!pick) return;
+      chosen = pick.entry;
+    }
+    this.settle(chosen[0]);
+    openSession(this.index.get(chosen[0]) || chosen[1].s);
+  }
+
+  // Show now if the window has focus, otherwise when it next does. With
+  // systemNotifications on, the operating system also shows it right away,
+  // since nothing in this window can be seen from another app.
+  notify(key, n) {
+    if (vscode.window.state.focused) return this.show(n);
+    this.held.set(key, n);
+    if (!vscode.workspace.getConfiguration('claudeCommandCenter').get('systemNotifications')) return;
+    const title = n.kind === 'attention' ? 'Claude needs you' : n.kind === 'subagent' ? 'Claude Code' : n.level === 'warning' ? 'Claude stopped' : 'Claude finished';
+    const folder = n.s && n.s.cwd;
+    this.systemNotify({
+      title,
+      body: `${n.where}: ${n.text}`,
+      // Clicking it (Windows) opens the project's folder, which brings its window to the front.
+      uri: folder ? `${vscode.env.uriScheme || 'vscode'}://file/${encodeURI(String(folder).replace(/\\/g, '/').replace(/^\/+/, ''))}` : undefined,
+      app: WINDOWS_APP_IDS[vscode.env.appName],
+      tag: `cc-${String(key).replace(/[^\w-]/g, '').slice(0, 40)}`,
+    });
+  }
+
+  flush() {
+    clearTimeout(this.flushTimer);
+    this.flushTimer = setTimeout(() => {
+      const list = [...this.held.values()];
+      this.held.clear();
+      if (list.length <= 2) return list.forEach((n) => this.show(n));
+      const names = [...new Set(list.map((n) => n.where))];
+      const text = `Claude is waiting in ${names.length} session${names.length === 1 ? '' : 's'}: ${names.slice(0, 4).join(', ')}${names.length > 4 ? ', …' : ''}`;
+      const fn = list.some((n) => n.level === 'warning') ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
+      Promise.resolve(fn(text, 'Show')).then(async (pick) => {
+        if (!pick) return;
+        const chosen = await vscode.window.showQuickPick(
+          list.map((n) => ({ label: n.where, description: n.text, n })),
+          { placeHolder: 'What happened while you were away' }
+        );
+        if (chosen) openSession(this.index.get(chosen.n.s.id) || chosen.n.s);
+      });
+    }, 300);
   }
 
   // Whether the turn that just ended was shorter than notifyTurnMinSeconds.
@@ -1637,6 +2154,9 @@ class Notifier {
   async shortTurn(ev) {
     const min = (vscode.workspace.getConfiguration('claudeCommandCenter').get('notifyTurnMinSeconds') || 0) * 1000;
     if (!min) return false;
+    // The hook records when each prompt is sent. Sessions started before it did are read from their transcript.
+    const prompted = this.store.turnStarts && this.store.turnStarts.get(ev.session);
+    if (prompted && prompted <= ev.ts) return ev.ts - prompted < min;
     try {
       await this.index.refresh(sessionDays()); // the prompt may not have been read yet
     } catch {}
@@ -1649,37 +2169,64 @@ class Notifier {
       if (ev.agentId) this.subagents.set(ev.agentId, ev.ts);
       return;
     }
+    if (ev.type === 'prompt') {
+      // A new turn: nothing from the one before is waiting any more.
+      this.settle(ev.session);
+      this.held.delete(ev.session);
+      return;
+    }
     if (!inWorkspace(ev.cwd)) return;
-    if (ev.type === 'turnEnd' && (!this.wanted('notifyTurnEnd') || (await this.shortTurn(ev)))) return;
+    if (ev.type === 'turnEnd') this.settle(ev.session); // whatever it was waiting for, the turn is over
+    // A turn that ended in an error is worth knowing about however short it was.
+    if (ev.type === 'turnEnd' && (!this.wanted('notifyTurnEnd') || (!ev.failed && (await this.shortTurn(ev))))) return;
     const s = this.index.get(ev.session) || { id: ev.session, cwd: ev.cwd };
     const where = s.title || s.lastPrompt ? sessionLabel(s) : path.basename(ev.cwd || '') || 'Claude Code';
     const snippet = (ev.message || '').split(/\r?\n/).find((l) => l.trim()) || '';
     const clip = (t) => (t.length > 140 ? t.slice(0, 140) + '…' : t);
+    const base = { s, where, ts: ev.ts };
 
     if (ev.type === 'turnEnd') {
       const last = this.lastTurnEnd.get(ev.session) || 0;
       if (ev.ts - last < 20 * 1000) return;
       this.lastTurnEnd.set(ev.session, ev.ts);
-      this.show('info', `Claude finished: ${where}${snippet ? ` — ${clip(snippet)}` : ''}`, s);
+      if (ev.failed) {
+        // rate_limit, authentication_failed, server_error, …
+        const text = `stopped: ${String(ev.error || 'error').replace(/_/g, ' ')}`;
+        this.notify(ev.session, { ...base, kind: 'finished', level: 'warning', text, message: `Claude ${text} (${where})` });
+        return;
+      }
+      const text = snippet ? clip(snippet) : 'finished';
+      this.notify(ev.session, { ...base, kind: 'finished', level: 'info', text, message: `Claude finished: ${where}${snippet ? ` — ${clip(snippet)}` : ''}` });
     } else if (ev.type === 'attention') {
       if (ev.kind && !ATTENTION_KINDS.has(ev.kind)) return;
+      if (vscode.workspace.getConfiguration('claudeCommandCenter').get('notifyAttention') === 'never') return;
+      const text = clip(snippet || 'waiting for permission');
+      // The calls it may be asking about: the ones running now. One of them ending means it was answered.
+      const pending = new Set();
+      for (const r of this.store.records.values()) if (r.session === ev.session && r.status === 'running') pending.add(r.id);
+      for (const ch of this.store.changes.values()) if (ch.session === ev.session && ch.status === 'pending') pending.add(ch.id);
+      this.attention.set(ev.session, { ...base, text, pending });
+      this.render();
       if (!this.wanted('notifyAttention')) return;
-      this.show('warning', `Claude needs you: ${clip(snippet || 'waiting for permission')} (${where})`, s);
+      this.notify(ev.session, { ...base, kind: 'attention', level: 'warning', text, message: `Claude needs you: ${text} (${where})` });
     } else if (ev.type === 'subagentEnd') {
       const started = this.subagents.get(ev.agentId);
       this.subagents.delete(ev.agentId);
+      // Claude Code's own helpers (prompt suggestions, /btw) end without a type; they aren't subagents Claude started.
+      if (!ev.agentType) return;
       if (!this.wanted('notifySubagentEnd')) return;
       const min = (vscode.workspace.getConfiguration('claudeCommandCenter').get('notifySubagentMinSeconds') || 0) * 1000;
       if (started == null ? min > 0 : ev.ts - started < min) return;
       const took = started != null ? ` after ${formatDuration(ev.ts - started)}` : '';
-      this.show('info', `Subagent ${ev.agentType || ''} finished${took} (${where})`.replace(/\s+/g, ' '), s);
+      const text = `Subagent ${ev.agentType || ''} finished${took}`.replace(/\s+/g, ' ');
+      this.notify(`agent:${ev.agentId || ev.ts}`, { ...base, kind: 'subagent', level: 'info', text, message: `${text} (${where})` });
     }
   }
 
-  async show(level, text, s) {
-    const fn = level === 'warning' ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
-    const pick = await fn(text, 'Open Session');
-    if (pick) openSession(this.index.get(s.id) || s);
+  async show(n) {
+    const fn = n.level === 'warning' ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
+    const pick = await fn(n.message, 'Open Session');
+    if (pick) openSession(this.index.get(n.s.id) || n.s);
   }
 }
 
@@ -1696,6 +2243,11 @@ class FailureIndicator {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49.5);
     this.item.command = 'claudeCommandCenter.showFailures';
     this.sub = store.onRecord(({ rec }) => rec.kind !== 'change' && this.update());
+    // A tab that only waits in the terminal list hasn't been looked at; one brought to the front has.
+    this.sawSub = terminals.onSawTab((rec) => {
+      this.seen.add(rec.id);
+      this.update();
+    });
     this.timer = setInterval(() => this.update(), 60 * 1000);
   }
 
@@ -1704,7 +2256,8 @@ class FailureIndicator {
     const out = [];
     for (const r of this.store.records.values()) {
       if (r.status !== 'failed' || !(r.endTs >= this.since) || now - r.endTs > FAILURE_FRESH_MS) continue;
-      if (this.terminals.terminals.has(r.id)) this.seen.add(r.id); // it has a tab
+      const tab = this.terminals.terminals.get(r.id);
+      if (tab && tab.seen) this.seen.add(r.id);
       if (!this.seen.has(r.id) && this.store.inScope(r)) out.push(r);
     }
     return out.sort((a, b) => b.endTs - a.endTs);
@@ -1753,13 +2306,13 @@ class FailureIndicator {
   dispose() {
     clearInterval(this.timer);
     this.sub.dispose();
+    this.sawSub.dispose();
     this.item.dispose();
   }
 }
 
 // Status bar: tokens Claude Code used on this machine, from its transcripts.
-function usageTooltip(u) {
-  const md = new vscode.MarkdownString();
+function usageTooltip(u, md = new vscode.MarkdownString()) {
   md.appendMarkdown('**Claude Code usage on this machine**\n\n');
   md.appendMarkdown('| | 5 hours | Today | 7 days |\n|---|--:|--:|--:|\n');
   const row = (label, k) => md.appendMarkdown(`| ${label} | ${formatTokens(u.fiveHours[k])} | ${formatTokens(u.today[k])} | ${formatTokens(u.week[k])} |\n`);
@@ -1895,17 +2448,25 @@ function describeToolUse(tool, input) {
 
 // A background process printed a local URL: offer to open it. Servers that
 // were already running when VS Code started aren't announced.
-async function announceUrl(store, rec) {
+// memento: this workspace's state, where the addresses not to offer again are kept.
+async function announceUrl(store, rec, memento) {
   if (rec.startTs < store.startedAt) return;
   const mode = vscode.workspace.getConfiguration('claudeCommandCenter').get('notifyServerUrl');
   if (mode === 'never' || (mode === 'unfocused' && vscode.window.state.focused)) return;
+  const muted = (memento && memento.get('mutedUrls')) || [];
+  if (muted.includes(rec.url)) return;
   const pick = await vscode.window.showInformationMessage(
     `${commandLabel(rec)} is serving ${rec.url}`,
     'Open in Browser',
-    'Open in VS Code'
+    'Open in VS Code',
+    'Don’t Offer Again'
   );
   if (pick === 'Open in Browser') openUrl(rec.url, false);
   else if (pick === 'Open in VS Code') openUrl(rec.url, true);
+  else if (pick && memento) {
+    await memento.update('mutedUrls', [...muted, rec.url].slice(-50));
+    vscode.window.setStatusBarMessage(`${rec.url} won’t be offered again in this workspace. It stays in the Commands list.`, 8000);
+  }
 }
 
 function openUrl(url, inEditor) {
@@ -2107,6 +2668,50 @@ function lastTurnStart(store, sessionId) {
 
 const SKIP_SHELL_CMD = 'claudeCommandCenter.addTerminalSelectionToChat';
 
+// The oldest Claude Code in use here, which decides which hook events can be
+// registered: the sessions running now and the editor's Claude Code extension.
+function claudeVersion() {
+  const ext = vscode.extensions.getExtension('anthropic.claude-code');
+  return hookSetup.claudeVersion(ext && ext.packageJSON && ext.packageJSON.version);
+}
+
+// The hook can't read VS Code settings, so the ones it needs are written next to it.
+function writeHookConfig() {
+  const config = { maskSecrets: vscode.workspace.getConfiguration('claudeCommandCenter').get('maskSecrets') !== false };
+  const file = path.join(hookSetup.homeDir(), 'config.json');
+  const text = JSON.stringify(config);
+  try {
+    if (fs.readFileSync(file, 'utf8') === text) return;
+  } catch {}
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+  } catch {}
+}
+
+// Drop history older than the historyDays setting, and mask secrets recorded
+// before masking existed. Done by history.js in a process of its own (this
+// editor's runtime, as Node), at most once a day across all windows.
+function maintainHistory(context) {
+  const cfg = vscode.workspace.getConfiguration('claudeCommandCenter');
+  const options = { historyDays: Math.max(0, Number(cfg.get('historyDays')) || 0), mask: cfg.get('maskSecrets') !== false };
+  try {
+    if (!history.isDue(logDir(), options)) return;
+    const child = cp.spawn(process.execPath, [path.join(context.extensionPath, 'history.js'), logDir(), JSON.stringify(options)], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch {}
+}
+
+// Tells the empty views whether to offer "Set up hooks".
+function setHookReady(ready) {
+  vscode.commands.executeCommand('setContext', 'claudeCommandCenter.hookReady', !!ready);
+}
+
 function bundledHook(context) {
   return path.join(context.extensionPath, 'hook', 'log-hook.js');
 }
@@ -2129,7 +2734,33 @@ async function addSkipShell() {
   }
 }
 
-async function runSetup(context, repaired) {
+// Every open window notices a missing or outdated hook at the same moment;
+// only one of them asks or acts. The lock is held for as long as its window
+// lives and hasn't finished.
+async function withSetupLock(fn) {
+  const lock = path.join(hookSetup.homeDir(), 'setup.lock');
+  try {
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    try {
+      const held = JSON.parse(fs.readFileSync(lock, 'utf8'));
+      if (held.pid !== process.pid && isAlive(held.pid)) return;
+      fs.unlinkSync(lock); // left by a window that has closed
+    } catch {}
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, ts: Date.now() }), { flag: 'wx' });
+  } catch {
+    return; // another window got there first
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      fs.unlinkSync(lock);
+    } catch {}
+  }
+}
+
+// how: 'repaired' or 'updated' when done without being asked, for the message.
+async function runSetup(context, how) {
   try {
     hookSetup.installHookFile(bundledHook(context));
   } catch (e) {
@@ -2151,7 +2782,7 @@ async function runSetup(context, repaired) {
     return false;
   }
   try {
-    hookSetup.registerHooks(command);
+    hookSetup.registerHooks(command, claudeVersion());
     hookSetup.migrateLegacy(); // the old hook is unregistered now, so its copy and any late events can move
   } catch (e) {
     const pick = await vscode.window.showErrorMessage(
@@ -2166,10 +2797,13 @@ async function runSetup(context, repaired) {
   } catch {}
   await context.globalState.update('setupDeclined', false);
   await context.globalState.update('hookOkSince', Date.now());
+  setHookReady(true);
   vscode.window.showInformationMessage(
-    repaired
+    how === 'repaired'
       ? 'Command Center repaired its Claude Code hook (the editor it ran on has moved or was removed). Restart open Claude Code sessions to keep recording.'
-      : 'Command Center for Claude Code is set up. Start a new Claude Code session (or restart the current one) to begin recording.'
+      : how === 'updated'
+        ? 'Command Center updated its Claude Code hook for this version. Claude Code sessions that are open now use it after a restart.'
+        : 'Command Center for Claude Code is set up. Start a new Claude Code session (or restart the current one) to begin recording.'
   );
   return true;
 }
@@ -2180,25 +2814,37 @@ async function checkSetup(context) {
   } catch {}
   let status;
   try {
-    status = hookSetup.hookStatus();
+    status = hookSetup.hookStatus(claudeVersion());
   } catch {
     return; // settings.json unreadable; the setup command reports details
   }
+  setHookReady(status === 'ok');
   if (status === 'ok') {
     // Sessions started after this should send events (see warnIfNoEvents).
     if (!context.globalState.get('hookOkSince')) await context.globalState.update('hookOkSince', Date.now());
     return;
   }
   if (status === 'missing' && context.globalState.get('setupDeclined')) return;
-  // Registered to run on an editor that is no longer there: nothing records until it's fixed.
-  if (status === 'stale') return void (await runSetup(context, true));
-  const msg =
-    status === 'outdated'
-      ? 'Command Center for Claude Code: your Claude Code hook is from an older setup. Update it?'
-      : 'Set up Command Center for Claude Code? This adds a logging hook to Claude Code (~/.claude/settings.json, a backup is kept) and an Alt+K shortcut for terminal selections.';
-  const pick = await vscode.window.showInformationMessage(msg, status === 'outdated' ? 'Update' : 'Enable', 'Not now', "Don't ask again");
-  if (pick === 'Enable' || pick === 'Update') await runSetup(context);
-  else if (pick === "Don't ask again") await context.globalState.update('setupDeclined', true);
+  await withSetupLock(async () => {
+    try {
+      if (hookSetup.hookStatus(claudeVersion()) !== status) return; // another window has just dealt with it
+    } catch {
+      return;
+    }
+    // Registered to run on an editor that is no longer there, or by an older
+    // version: the hook was agreed to already, so it is brought up to date
+    // without asking again.
+    if (status === 'stale') return void (await runSetup(context, 'repaired'));
+    if (status === 'outdated') return void (await runSetup(context, 'updated'));
+    const pick = await vscode.window.showInformationMessage(
+      'Set up Command Center for Claude Code? This adds a logging hook to Claude Code (~/.claude/settings.json, a backup is kept) and an Alt+K shortcut for terminal selections.',
+      'Enable',
+      'Not now',
+      "Don't ask again"
+    );
+    if (pick === 'Enable') await runSetup(context);
+    else if (pick === "Don't ask again") await context.globalState.update('setupDeclined', true);
+  });
 }
 
 async function showSetupCheck(context, store, index) {
@@ -2296,10 +2942,10 @@ function noEventsWarner(context, store, index) {
 // Activation
 // ---------------------------------------------------------------------------
 
-function appendEvent(ev) {
+function appendEvent(...events) {
   try {
     fs.mkdirSync(logDir(), { recursive: true });
-    fs.appendFileSync(path.join(logDir(), 'events.jsonl'), JSON.stringify(ev) + '\n');
+    fs.appendFileSync(path.join(logDir(), 'events.jsonl'), events.map((ev) => JSON.stringify(ev) + '\n').join(''));
   } catch {}
 }
 
@@ -2312,34 +2958,37 @@ function activate(context) {
     context.workspaceState.get('scope') ||
     vscode.workspace.getConfiguration('claudeCommandCenter').get('scope') ||
     'workspace';
-  const provider = new Provider(store);
+  const index = new sessions.SessionIndex();
+  const provider = new Provider(store, index);
   const terminals = new TerminalManager(store);
+  terminals.memento = context.workspaceState;
 
   const view = vscode.window.createTreeView('claudeCommandCenter.commands', { treeDataProvider: provider });
   const monitor = new ResourceMonitor(store, terminals, view, provider);
   context.subscriptions.push(monitor);
   const changesView = vscode.window.createTreeView('claudeCommandCenter.changes', { treeDataProvider: new ChangesProvider(store) });
+  writeHookConfig();
   pruneOldFiles();
+  // A while after startup, at a different moment in each window, then a few times a day.
+  const historyFirst = setTimeout(() => maintainHistory(context), 20000 + Math.random() * 20000);
+  const historyTimer = setInterval(() => maintainHistory(context), 6 * 60 * 60 * 1000);
+  context.subscriptions.push({ dispose: () => (clearTimeout(historyFirst), clearInterval(historyTimer)) });
   const pruneTimer = setInterval(pruneOldFiles, 60 * 60 * 1000); // windows stay open for days
   context.subscriptions.push({ dispose: () => clearInterval(pruneTimer) });
 
-  const index = new sessions.SessionIndex();
   const sessionsProvider = new SessionsProvider(store, index);
   const sessionsView = vscode.window.createTreeView('claudeCommandCenter.sessions', { treeDataProvider: sessionsProvider });
-  new Notifier(store, index);
+  const notifier = new Notifier(store, index);
   const failures = new FailureIndicator(store, terminals);
-  context.subscriptions.push(failures);
+  context.subscriptions.push(failures, notifier);
   const permissions = new PermissionBroker();
-  const dashboard = new Dashboard(context, store, findTaskOutput, index);
+  const dashboard = new Dashboard(context, store, findTaskOutput, index, (rec) => terminals.claimLiveOutput(rec), commandLabel);
 
-  const usageItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
-  usageItem.command = 'claudeCommandCenter.sessions.focus';
+  // Token usage is part of the main status bar item (see updateStatusText), not an item of its own.
+  let usage = null;
   const updateUsage = () => {
-    if (!vscode.workspace.getConfiguration('claudeCommandCenter').get('showUsage')) return usageItem.hide();
-    const u = index.usage();
-    usageItem.text = `$(graph) 5h: ${formatTokens(u.fiveHours.output)} out`;
-    usageItem.tooltip = usageTooltip(u);
-    usageItem.show();
+    usage = vscode.workspace.getConfiguration('claudeCommandCenter').get('showUsage') ? index.usage() : null;
+    updateStatusText();
   };
 
   // Transcripts are re-read every few seconds while the window has focus.
@@ -2357,6 +3006,7 @@ function activate(context) {
     if (signature === lastSignature) return;
     lastSignature = signature;
     sessionsProvider.refresh();
+    provider.refresh(); // commands are listed under their session's title
     sessionsView.description = list.length ? `${list.filter((s) => s.live).length} open · ${list.length}` : undefined;
     dashboard.pushState();
   };
@@ -2368,6 +3018,11 @@ function activate(context) {
       if (e.affectsConfiguration('claudeCommandCenter.showUsage')) updateUsage();
       if (e.affectsConfiguration('claudeCommandCenter.showFailures')) failures.update();
       if (e.affectsConfiguration('claudeCommandCenter.sessionDays')) refreshSessions(true);
+      if (e.affectsConfiguration('claudeCommandCenter.commandList')) {
+        provider.refresh();
+        dashboard.pushState();
+      }
+      if (e.affectsConfiguration('claudeCommandCenter.maskSecrets')) writeHookConfig();
     })
   );
   // A session object from the Sessions view, or a session ID from the dashboard
@@ -2377,13 +3032,45 @@ function activate(context) {
     return (id && index.get(id)) || (arg && typeof arg === 'object' ? arg : undefined);
   };
 
+  // The status bar names the command Claude is running, once it has run for a
+  // moment; clicking it opens that command's tab. Otherwise it opens the dashboard.
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
-  status.command = 'claudeCommandCenter.dashboard';
+  status.command = 'claudeCommandCenter.statusClick';
+  const shownCommand = () => store.runningForeground().find((r) => Date.now() - r.startTs >= STATUS_NAME_AFTER_MS);
+  let tooltipKey = '';
+  const updateStatusText = () => {
+    const n = store.runningCount();
+    const rec = shownCommand();
+    const where = store.scope === 'all' ? 'all workspaces' : 'this workspace';
+    if (rec) {
+      const others = n > 1 ? ` +${n - 1}` : '';
+      const name = commandLabel(rec).slice(0, 32).replace(/\$\(/g, '$ ('); // "$(…)" would be drawn as an icon
+      status.text = `$(sync~spin) Claude: ${name} · ${formatSeconds(Date.now() - rec.startTs)}${others}`;
+    } else {
+      const tokens = usage ? ` · 5h: ${formatTokens(usage.fiveHours.output)} out` : '';
+      status.text = (n ? `$(pulse) Claude: ${n} running` : '$(terminal) Claude') + tokens;
+    }
+    // Rebuilt only when it would read differently: setting it closes a tooltip that is open.
+    const lead = rec ? `Claude is running this command (${where}). Click to watch its output.` : `Command Center for Claude Code (${where}). Click to open the dashboard.`;
+    const key = lead + (usage ? JSON.stringify([usage.fiveHours, usage.today.total, usage.week.total]) : '');
+    if (key === tooltipKey) return;
+    tooltipKey = key;
+    const md = new vscode.MarkdownString(lead + '\n\n');
+    if (usage) {
+      usageTooltip(usage, md);
+      md.appendMarkdown('\n\n[Show sessions](command:claudeCommandCenter.sessions.focus)');
+      md.isTrusted = { enabledCommands: ['claudeCommandCenter.sessions.focus'] };
+    }
+    status.tooltip = md;
+  };
+  const statusTicker = setInterval(() => {
+    if (store.runningForeground().length) updateStatusText();
+  }, 1000);
+  context.subscriptions.push({ dispose: () => clearInterval(statusTicker) });
   const updateStatus = () => {
     const n = store.runningCount();
-    status.text = n ? `$(pulse) Claude: ${n} running` : '$(terminal) Claude';
+    updateStatusText();
     const where = store.scope === 'all' ? 'all workspaces' : 'this workspace';
-    status.tooltip = `Command Center for Claude Code (${where})`;
     status.show();
     view.badge = n ? { value: n, tooltip: `${n} running` } : undefined;
     view.description = where;
@@ -2400,6 +3087,12 @@ function activate(context) {
     terminals.open(rec);
     failures.update(); // an opened failure is no longer counted
   });
+  reg('claudeCommandCenter.statusClick', () => {
+    const rec = shownCommand();
+    if (rec) terminals.open(rec);
+    else dashboard.show();
+  });
+  reg('claudeCommandCenter.openWaiting', () => notifier.openWaiting());
   reg('claudeCommandCenter.showFailures', () => failures.open());
   reg('claudeCommandCenter.openFeed', () => terminals.openFeed());
   reg('claudeCommandCenter.dashboard', () => dashboard.show());
@@ -2414,6 +3107,7 @@ function activate(context) {
     if (pick !== 'Remove') return;
     try {
       hookSetup.unregisterHooks();
+      setHookReady(false);
       await context.globalState.update('setupDeclined', true);
       vscode.window.showInformationMessage('Hook removed. Run "Command Center: Set Up Hooks" to add it back.');
     } catch (e) {
@@ -2564,10 +3258,7 @@ function activate(context) {
     context.workspaceState.update('scope', next);
     store.setScope(next);
   });
-  reg('claudeCommandCenter.refresh', () => {
-    store.reset();
-    store.read();
-  });
+  reg('claudeCommandCenter.refresh', () => store.reload());
   reg('claudeCommandCenter.clear', async () => {
     const pick = await vscode.window.showWarningMessage(
       'Clear the recorded commands and file changes for all windows? Saved file snapshots and the files made for Claude chat mentions are deleted too.',
@@ -2627,7 +3318,7 @@ function activate(context) {
   refreshSessions(true);
   checkSetup(context);
 
-  context.subscriptions.push(view, changesView, sessionsView, status, usageItem, { dispose: () => store.dispose() }, provider, terminals, permissions);
+  context.subscriptions.push(view, changesView, sessionsView, status, { dispose: () => store.dispose() }, provider, terminals, permissions, { dispose: closeProcessSession });
 }
 
 function deactivate() {}
@@ -2636,5 +3327,5 @@ function deactivate() {}
 module.exports = {
   activate,
   deactivate,
-  _internals: { commandLabel, Store, TerminalManager, Notifier, FailureIndicator, pickHookCommand },
+  _internals: { commandLabel, Store, TerminalManager, Notifier, FailureIndicator, pickHookCommand, groupBySession, foldQuick },
 };

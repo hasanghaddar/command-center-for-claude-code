@@ -7,14 +7,53 @@ const path = require('path');
 
 const MATCHER = 'Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit';
 const TOOL_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
-// Registered without a matcher: every turn end, subagent, notification and
-// permission request.
-const SESSION_EVENTS = ['Stop', 'SubagentStart', 'SubagentStop', 'Notification', 'PermissionRequest'];
+// Registered without a matcher: every prompt, turn end, subagent, notification
+// and permission request.
+const SESSION_EVENTS = ['UserPromptSubmit', 'Stop', 'SubagentStart', 'SubagentStop', 'Notification', 'PermissionRequest'];
+// Events newer Claude Code versions added, with the version that added them.
+// It isn't documented what an older Claude Code does with a hook event it
+// doesn't know, so these are registered only when every Claude Code seen on
+// this machine is new enough (see claudeVersion).
+const SINCE = { StopFailure: '2.1.78' }; // a turn that ends in an API error
 // Seconds Claude Code lets the hook run. A permission request can wait for an
 // answer from VS Code (up to the permissionTimeoutSeconds setting, max 300).
 const timeoutFor = (ev) => (ev === 'PermissionRequest' ? 310 : 10);
-const EVENTS = [...TOOL_EVENTS, ...SESSION_EVENTS];
+const EVENTS = [...TOOL_EVENTS, ...SESSION_EVENTS]; // always registered
+const ALL_EVENTS = [...EVENTS, ...Object.keys(SINCE)];
 const matcherFor = (ev) => (TOOL_EVENTS.includes(ev) ? MATCHER : undefined);
+
+// Whether dotted version a is at least b.
+function atLeast(a, b) {
+  const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return true;
+}
+
+// The events to register for a Claude Code of this version (undefined: not known).
+function eventsFor(version) {
+  return ALL_EVENTS.filter((ev) => !SINCE[ev] || (!!version && atLeast(version, SINCE[ev])));
+}
+
+// The oldest Claude Code in use here: the ones running now (each writes its
+// version to ~/.claude/sessions/<pid>.json) and any passed in, such as the
+// editor's Claude Code extension. undefined when none is known.
+function claudeVersion(...known) {
+  const versions = known.filter(Boolean);
+  try {
+    const dir = path.join(claudeDir(), 'sessions');
+    for (const n of fs.readdirSync(dir)) {
+      if (!/^\d+\.json$/.test(n)) continue;
+      try {
+        const v = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')).version;
+        if (typeof v === 'string') versions.push(v);
+      } catch {}
+    }
+  } catch {}
+  return versions.reduce((oldest, v) => (oldest === undefined || !atLeast(v, oldest) ? v : oldest), undefined);
+}
 
 function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -164,26 +203,29 @@ function installHookFile(bundledHook) {
   return true;
 }
 
-// 'ok' | 'missing' | 'outdated' (ours, but an old path or matcher) |
-// 'stale' (ours and current, but the editor runtime it runs on is gone)
-function hookStatus() {
+// 'ok' | 'missing' | 'outdated' (ours, but an old path or matcher, or an
+// event not registered yet) | 'stale' (ours and current, but the editor
+// runtime it runs on is gone).
+// version: the Claude Code in use (claudeVersion), which decides whether the
+// newer events are expected. One of those already registered is fine either way.
+function hookStatus(version) {
   const s = readSettings();
-  let ok = 0;
+  const state = {}; // event -> 'ok' | 'stale'
   let ours = 0;
-  let stale = 0;
-  for (const ev of EVENTS) {
+  let wrong = 0;
+  for (const ev of ALL_EVENTS) {
     for (const m of (s.hooks && s.hooks[ev]) || []) {
       for (const h of m.hooks || []) {
         if (!isOurHook(h)) continue;
         ours++;
-        const state = (m.matcher || undefined) === matcherFor(ev) ? commandState(h.command) : 'other';
-        if (state === 'ok') ok++;
-        else if (state === 'stale') stale++;
+        const st = (m.matcher || undefined) === matcherFor(ev) ? commandState(h.command) : 'other';
+        if (st === 'other' || state[ev]) wrong++; // an old path or matcher, or registered twice
+        else state[ev] = st;
       }
     }
   }
-  if (ok === EVENTS.length && ours === EVENTS.length) return 'ok';
-  if (stale && ok + stale === EVENTS.length && ours === EVENTS.length) return 'stale';
+  const complete = !wrong && eventsFor(version).every((ev) => state[ev]);
+  if (complete) return Object.values(state).includes('stale') ? 'stale' : 'ok';
   return ours ? 'outdated' : 'missing';
 }
 
@@ -193,14 +235,21 @@ function withoutOurHooks(groups) {
     .filter((m) => m.hooks.length);
 }
 
-function registerHooks(command = hookCommand()) {
+// version: the Claude Code in use (claudeVersion). A newer event that is
+// registered already stays registered when the version isn't known this time.
+function registerHooks(command = hookCommand(), version) {
   const s = readSettings();
   s.hooks = s.hooks || {};
-  for (const ev of EVENTS) {
+  const wanted = eventsFor(version);
+  for (const ev of ALL_EVENTS) {
+    const had = (s.hooks[ev] || []).some((m) => (m.hooks || []).some(isOurHook));
     s.hooks[ev] = withoutOurHooks(s.hooks[ev]);
-    const group = { hooks: [{ type: 'command', command, timeout: timeoutFor(ev) }] };
-    if (matcherFor(ev)) group.matcher = matcherFor(ev);
-    s.hooks[ev].push(group);
+    if (wanted.includes(ev) || (SINCE[ev] && had)) {
+      const group = { hooks: [{ type: 'command', command, timeout: timeoutFor(ev) }] };
+      if (matcherFor(ev)) group.matcher = matcherFor(ev);
+      s.hooks[ev].push(group);
+    }
+    if (!s.hooks[ev].length) delete s.hooks[ev];
   }
   writeSettings(s);
 }
@@ -222,7 +271,11 @@ function unregisterHooks() {
 
 module.exports = {
   EVENTS,
+  ALL_EVENTS,
+  eventsFor,
+  claudeVersion,
   claudeDir,
+  homeDir,
   mergeByTime,
   settingsPath,
   readSettings,

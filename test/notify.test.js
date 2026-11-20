@@ -3,7 +3,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { state, wait, fakeStore, runningCommand } = require('./stub-vscode');
+const { state, wait, fakeStore, runningCommand, setFocused } = require('./stub-vscode');
 const { Notifier, FailureIndicator, TerminalManager } = require('../extension.js')._internals;
 const { applyLine, newEntry } = require('../sessions.js');
 
@@ -25,13 +25,20 @@ function notifier(config, lastPromptTs) {
   state.messages.length = 0;
   const store = fakeStore();
   let refreshed = 0;
-  const index = { refresh: async () => void refreshed++, get: (id) => ({ id, title: 'My session', lastPromptTs }) };
-  new Notifier(store, index);
-  const turnEnd = async (ts) => {
-    store.fireSession({ type: 'turnEnd', session: 's1', cwd: 'E:/Work/app', ts, message: 'Done.' });
+  const index = { refresh: async () => void refreshed++, get: (id) => ({ id, title: `Session ${id}`, lastPromptTs, live: 'idle' }) };
+  const n = new Notifier(store, index);
+  const send = async (ev) => {
+    store.fireSession({ session: 's1', cwd: 'E:/Work/app', ts: Date.now(), ...ev });
     await wait();
   };
-  return { turnEnd, refreshed: () => refreshed };
+  const turnEnd = (ts, session = 's1') => send({ type: 'turnEnd', session, ts, message: 'Done.' });
+  return { turnEnd, send, store, refreshed: () => refreshed, statusItem: n.item, dispose: () => n.dispose() };
+}
+
+// The window gets focus back; held notifications show a moment later.
+async function comeBack() {
+  setFocused(true);
+  await wait(350);
 }
 
 test('no notification for a turn shorter than notifyTurnMinSeconds', async () => {
@@ -46,7 +53,7 @@ test('a longer turn is notified', async () => {
   const now = Date.now();
   await notifier({}, now - 45 * 1000).turnEnd(now);
   assert.equal(state.messages.length, 1);
-  assert.match(state.messages[0], /^Claude finished: My session — Done\./);
+  assert.match(state.messages[0], /^Claude finished: Session s1 — Done\./);
 });
 
 test('notifyTurnMinSeconds 0 notifies for every turn', async () => {
@@ -65,10 +72,77 @@ test('notifyTurnEnd "unfocused" stays quiet while the window is focused', async 
   state.focused = true;
   await notifier({ notifyTurnEnd: 'unfocused' }, now - 60 * 1000).turnEnd(now);
   assert.deepEqual(state.messages, []);
-  state.focused = false;
-  await notifier({ notifyTurnEnd: 'unfocused' }, now - 60 * 1000).turnEnd(now);
+});
+
+test('a notification raised while the window has no focus is shown when it gets focus back', async () => {
+  const now = Date.now();
+  const n = notifier({ notifyTurnEnd: 'unfocused' }, now - 60 * 1000);
+  setFocused(false);
+  await n.turnEnd(now);
+  await n.turnEnd(now + 30 * 1000); // a second turn of the same session ends meanwhile
+  assert.deepEqual(state.messages, [], 'nobody is looking yet');
+  await comeBack();
+  assert.equal(state.messages.length, 1, 'one per session, not one per turn');
+  n.dispose();
+});
+
+test('a held notification is dropped when Claude has carried on meanwhile', async () => {
+  const now = Date.now();
+  const n = notifier({ notifyTurnEnd: 'unfocused' }, now - 60 * 1000);
+  setFocused(false);
+  await n.turnEnd(now);
+  n.store.fireRecord(runningCommand('npm test', { session: 's1', startTs: now + 5000 }), 'start'); // prompted again from elsewhere
+  await comeBack();
+  assert.deepEqual(state.messages, []);
+  n.dispose();
+});
+
+test('several sessions that finished while away share one notification', async () => {
+  const now = Date.now();
+  const n = notifier({ notifyTurnEnd: 'unfocused' }, now - 60 * 1000);
+  setFocused(false);
+  for (const session of ['a', 'b', 'c']) await n.turnEnd(now, session);
+  await comeBack();
   assert.equal(state.messages.length, 1);
-  state.focused = true;
+  assert.match(state.messages[0], /^Claude is waiting in 3 sessions: Session a, Session b, Session c/);
+  n.dispose();
+});
+
+test('the status bar says Claude needs you until the session carries on', async () => {
+  const n = notifier({ notifyAttention: 'unfocused' }, 0);
+  setFocused(true);
+  const asking = runningCommand('rm -rf build', { session: 's1' }); // the call Claude wants permission for
+  n.store.records.set(asking.id, asking);
+  await n.send({ type: 'attention', kind: 'permission_prompt', message: 'Claude needs your permission to use Bash' });
+  assert.equal(n.statusItem.visible, true);
+  assert.match(n.statusItem.text, /Claude needs you/);
+  assert.deepEqual(state.messages, [], 'no notification while the window has focus and the setting is "unfocused"');
+
+  n.store.fireRecord({ ...runningCommand('ls', { session: 's1' }), status: 'ok' }, 'end'); // some other call ends: still waiting
+  assert.equal(n.statusItem.visible, true);
+  n.store.fireRecord(asking, 'end'); // allowed, and it ran
+  assert.equal(n.statusItem.visible, false);
+
+  await n.send({ type: 'attention', kind: 'permission_prompt', message: 'again' });
+  assert.equal(n.statusItem.visible, true);
+  await n.turnEnd(Date.now()); // denied: the turn ends
+  assert.equal(n.statusItem.visible, false);
+
+  await n.send({ type: 'attention', kind: 'auth_success', message: 'not a request' });
+  assert.equal(n.statusItem.visible, false, 'only requests for the user count');
+  n.dispose();
+});
+
+test('helpers Claude Code runs on its own are not reported as subagents', async () => {
+  const n = notifier({ notifySubagentEnd: 'always', notifySubagentMinSeconds: 0 }, 0);
+  setFocused(true);
+  await n.send({ type: 'subagentEnd', agentId: 'x1' }); // prompt suggestions, /btw: no type
+  assert.deepEqual(state.messages, []);
+  await n.send({ type: 'subagentStart', agentId: 'x2', agentType: 'Explore' });
+  await n.send({ type: 'subagentEnd', agentId: 'x2', agentType: 'Explore' });
+  assert.equal(state.messages.length, 1);
+  assert.match(state.messages[0], /^Subagent Explore finished/);
+  n.dispose();
 });
 
 test('the status bar counts recent failures until their output is opened', async () => {
@@ -114,4 +188,106 @@ test('the status bar counts recent failures until their output is opened', async
   for (const t of terminals.terminals.values()) t.dispose();
   terminals.dispose();
   failures.dispose();
+});
+
+test('a new prompt clears what was waiting for the user', async () => {
+  const n = notifier({ notifyAttention: 'unfocused', notifyTurnEnd: 'unfocused' }, 0);
+  setFocused(true);
+  await n.send({ type: 'attention', kind: 'agent_needs_input', message: 'Which database?' });
+  assert.equal(n.statusItem.visible, true);
+  await n.send({ type: 'prompt' }); // answered
+  assert.equal(n.statusItem.visible, false);
+
+  setFocused(false);
+  await n.turnEnd(Date.now());
+  await n.send({ type: 'prompt' }); // prompted again from another window or a terminal
+  await comeBack();
+  assert.deepEqual(state.messages, [], 'the finished turn is old news');
+  n.dispose();
+});
+
+test('the length of a turn is taken from its recorded prompt', async () => {
+  const now = Date.now();
+  const n = notifier({}, now - 300 * 1000); // the transcript's last prompt is older
+  setFocused(true);
+  n.store.turnStarts.set('s1', now - 10 * 1000);
+  await n.turnEnd(now);
+  assert.deepEqual(state.messages, [], '10 seconds: too short to notify');
+  assert.equal(n.refreshed(), 0, 'no need to read the transcript');
+  n.store.turnStarts.set('s1', now - 60 * 1000);
+  await n.turnEnd(now + 30 * 1000);
+  assert.equal(state.messages.length, 1);
+  n.dispose();
+});
+
+test('a turn that ends in an error is notified, however short', async () => {
+  const now = Date.now();
+  const n = notifier({}, now - 5000);
+  setFocused(true);
+  await n.send({ type: 'turnEnd', failed: true, error: 'rate_limit', ts: now });
+  assert.deepEqual(state.messages, ['Claude stopped: rate limit (Session s1)']);
+  n.dispose();
+});
+
+test('with systemNotifications on, the operating system notifies while the window is not in front', async () => {
+  const shown = [];
+  const setup = (config) => {
+    state.config = { notifyTurnEnd: 'unfocused', notifyAttention: 'unfocused', notifyTurnMinSeconds: 0, ...config };
+    state.messages.length = 0;
+    shown.length = 0;
+    const store = fakeStore();
+    const index = { refresh: async () => {}, get: (id) => ({ id, title: 'Fix the login bug', cwd: 'E:\\Work\\my app', live: 'idle' }) };
+    const n = new Notifier(store, index, { systemNotify: (x) => shown.push(x) });
+    const send = async (ev) => {
+      store.fireSession({ session: 's1', cwd: 'E:\\Work\\my app', ts: Date.now(), ...ev });
+      await wait();
+    };
+    return { n, send };
+  };
+
+  let t = setup({ systemNotifications: true });
+  setFocused(false);
+  await t.send({ type: 'turnEnd', message: 'All tests pass.' });
+  await t.send({ type: 'attention', kind: 'permission_prompt', message: 'Claude needs your permission to use Bash' });
+  assert.deepEqual(shown.map((x) => [x.title, x.body]), [
+    ['Claude finished', 'Fix the login bug: All tests pass.'],
+    ['Claude needs you', 'Fix the login bug: Claude needs your permission to use Bash'],
+  ]);
+  assert.equal(shown[0].uri, 'vscode://file/E:/Work/my%20app', 'clicking it opens the project, which brings its window forward');
+  assert.deepEqual(state.messages, [], 'the notification inside the window still waits for it to have focus');
+  t.n.dispose();
+
+  t = setup({ systemNotifications: true });
+  setFocused(true);
+  await t.send({ type: 'turnEnd', message: 'Done.' });
+  assert.deepEqual(shown, [], 'not while the window is in front');
+  t.n.dispose();
+
+  t = setup({ systemNotifications: false });
+  setFocused(false);
+  await t.send({ type: 'turnEnd', message: 'Done.' });
+  assert.deepEqual(shown, [], 'not unless it is turned on');
+  t.n.dispose();
+  setFocused(true);
+});
+
+test('a system notification is built without putting its text into a script', () => {
+  const { command } = require('../notify-os.js');
+  const n = { title: 'Claude needs you', body: 'app: run "rm -rf $HOME"; `whoami` <b>&', uri: 'vscode://file/E:/Work/app', app: 'Microsoft.VisualStudioCode' };
+
+  const win = command(n, 'win32');
+  assert.equal(win.file, 'powershell.exe');
+  assert.ok(!win.args.join(' ').includes('whoami'), 'the text is not part of the command');
+  assert.match(win.env.CC_NOTIFY_XML, /^<toast activationType="protocol" launch="vscode:\/\/file\/E:\/Work\/app">/);
+  assert.ok(win.env.CC_NOTIFY_XML.includes('run &quot;rm -rf $HOME&quot;; `whoami` &lt;b&gt;&amp;'), 'and is escaped where it goes');
+  assert.equal(win.env.CC_NOTIFY_APP, 'Microsoft.VisualStudioCode');
+
+  const mac = command(n, 'darwin');
+  assert.equal(mac.file, 'osascript');
+  assert.ok(!mac.args.join(' ').includes('whoami'));
+  assert.equal(mac.env.CC_NOTIFY_BODY, n.body);
+
+  const linux = command(n, 'linux');
+  assert.deepEqual(linux.args.slice(-3), ['--', n.title, n.body]);
+  assert.equal(command(n, 'aix'), null);
 });

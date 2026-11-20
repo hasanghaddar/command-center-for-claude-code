@@ -2,6 +2,7 @@
 // Plain Node (no vscode import) so it can be tested on its own.
 
 const cp = require('child_process');
+const { redact } = require('./hook/log-hook.js');
 
 // Letters and digits only, so shell quoting/escaping differences don't matter.
 const normalize = (s) => String(s || '').replace(/[^A-Za-z0-9]/g, '').toLowerCase();
@@ -32,10 +33,111 @@ function matchTaskProcesses(procs, rec, selfPid = process.pid) {
     if (p.pid === selfPid || !p.cmd) return false;
     if (redirectsToTask(p.cmd, rec.backgroundTaskId)) return true;
     const wrapped = wrappedCommand(p.cmd);
-    return needle.length >= 4 && wrapped != null && normalize(wrapped) === needle;
+    if (needle.length < 4 || wrapped == null) return false;
+    // The recorded command has its secrets masked; the running one doesn't.
+    return normalize(wrapped) === needle || normalize(redact(wrapped, true)) === needle;
   });
   const ids = new Set(matching.map((p) => p.pid));
   return matching.filter((p) => !ids.has(p.ppid)).map((p) => p.pid);
+}
+
+// Windows: the process list comes from PowerShell, and starting PowerShell is
+// most of the cost (measured: about 1.8 s for a new one each time, 0.4 s for a
+// query in one that is already running). So one is kept open while readings
+// are being taken, and closes after a while without use.
+const PS_IDLE_MS = 90 * 1000;
+const PS_QUERY_TIMEOUT_MS = 20 * 1000;
+let ps = null; // { child, buf, pending, idle }
+let psQueue = Promise.resolve();
+
+function closeSession() {
+  if (!ps) return;
+  const s = ps;
+  ps = null;
+  clearTimeout(s.idle);
+  if (s.pending) s.pending.finish(null);
+  try {
+    s.child.stdin.end(); // PowerShell exits when its input ends
+  } catch {}
+  const kill = setTimeout(() => {
+    try {
+      s.child.kill();
+    } catch {}
+  }, 3000);
+  if (kill.unref) kill.unref();
+}
+
+function openSession() {
+  const child = cp.spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-NoLogo', '-Command', '-'], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  const s = { child, buf: '', pending: null, idle: null };
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (d) => {
+    s.buf += d;
+    if (!s.pending) return;
+    const at = s.buf.indexOf(s.pending.marker);
+    if (at >= 0) s.pending.finish(s.buf.slice(0, at));
+  });
+  const gone = () => {
+    if (ps === s) ps = null;
+    clearTimeout(s.idle);
+    if (s.pending) s.pending.finish(null);
+  };
+  child.on('error', gone);
+  child.on('exit', gone);
+  child.stdin.on('error', () => {});
+  child.stdin.write('[Console]::OutputEncoding = [Text.Encoding]::UTF8\n');
+  if (child.unref) child.unref();
+  return s;
+}
+
+// Run one pipeline in the kept-open PowerShell; its output, or null if that didn't work.
+function psQuery(query) {
+  const run = () =>
+    new Promise((resolve) => {
+      let s;
+      try {
+        s = ps || (ps = openSession());
+      } catch {
+        return resolve(null);
+      }
+      clearTimeout(s.idle);
+      const marker = `<<done-${Date.now()}-${Math.random().toString(36).slice(2)}>>`;
+      const timer = setTimeout(() => {
+        if (ps === s) closeSession(); // stuck: start afresh next time
+        else finish(null);
+      }, PS_QUERY_TIMEOUT_MS);
+      const finish = (out) => {
+        if (s.pending !== pending) return;
+        s.pending = null;
+        s.buf = '';
+        clearTimeout(timer);
+        if (ps === s) {
+          s.idle = setTimeout(closeSession, PS_IDLE_MS);
+          if (s.idle.unref) s.idle.unref();
+        }
+        resolve(out);
+      };
+      const pending = (s.pending = { marker, finish });
+      s.buf = '';
+      try {
+        s.child.stdin.write(`${query}; '${marker}'\n`);
+      } catch {
+        finish(null);
+      }
+    });
+  const result = psQueue.then(run, run);
+  psQueue = result.catch(() => {});
+  return result;
+}
+
+function parseWindowsProcesses(out) {
+  return [].concat(JSON.parse(out)).map((p) => ({
+    pid: p.ProcessId,
+    ppid: p.ParentProcessId,
+    cmd: p.CommandLine || '',
+    mem: p.WorkingSetSize || 0,
+    cpuMs: ((p.KernelModeTime || 0) + (p.UserModeTime || 0)) / 10000, // 100 ns units
+  }));
 }
 
 // [{ pid, ppid, cmd, mem, cpuMs | pcpu }]: mem is resident bytes; Windows
@@ -57,25 +159,22 @@ function listProcesses() {
     }
     // Processes without a command line (system ones) are kept for their parent
     // links and usage only.
-    const ps =
+    const query =
       'Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CommandLine,WorkingSetSize,KernelModeTime,UserModeTime | ' +
       'Where-Object { $_.ProcessId -ne $PID } | ' +
       'Select-Object ProcessId,ParentProcessId,CommandLine,WorkingSetSize,KernelModeTime,UserModeTime | ConvertTo-Json -Compress';
-    cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
-      if (err) return resolve([]);
+    psQuery(query).then((out) => {
       try {
-        resolve(
-          [].concat(JSON.parse(out)).map((p) => ({
-            pid: p.ProcessId,
-            ppid: p.ParentProcessId,
-            cmd: p.CommandLine || '',
-            mem: p.WorkingSetSize || 0,
-            cpuMs: ((p.KernelModeTime || 0) + (p.UserModeTime || 0)) / 10000, // 100 ns units
-          }))
-        );
-      } catch {
-        resolve([]);
-      }
+        if (out && out.trim()) return resolve(parseWindowsProcesses(out));
+      } catch {}
+      // The kept-open PowerShell didn't answer: ask a new one, as before.
+      cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', query], { windowsHide: true, maxBuffer: 64 * 1024 * 1024 }, (err, text) => {
+        try {
+          resolve(err ? [] : parseWindowsProcesses(text));
+        } catch {
+          resolve([]);
+        }
+      });
     });
   });
 }
@@ -116,4 +215,4 @@ async function killTree(pid) {
   }
 }
 
-module.exports = { findTaskPids, killTree, matchTaskProcesses, redirectsToTask, wrappedCommand, listProcesses, processTree };
+module.exports = { findTaskPids, killTree, matchTaskProcesses, redirectsToTask, wrappedCommand, listProcesses, processTree, closeSession };

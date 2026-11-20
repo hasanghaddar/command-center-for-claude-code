@@ -5,12 +5,15 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const grouping = require('./grouping');
 
 const MAX_INITIAL_OUTPUT = 512 * 1024;
 
-function summarize(rec) {
+// label(rec): what the sidebar calls the command (its description, or the command without its setup steps).
+function summarize(rec, label) {
   return {
     id: rec.id,
+    label: label ? label(rec) : undefined,
     session: rec.session,
     tool: rec.tool,
     command: rec.command,
@@ -56,8 +59,7 @@ function summarizeChange(ch) {
     status: ch.status,
     created: !!ch.created,
     ts: ch.ts,
-    oldString: clipPreview(ch.oldString),
-    newString: clipPreview(ch.newString),
+    hasText: ch.oldString != null || ch.newString != null, // sent when the change is selected (changeText)
     replaceAll: ch.replaceAll,
     edits: ch.edits,
     error: ch.error,
@@ -66,11 +68,15 @@ function summarizeChange(ch) {
 }
 
 class Dashboard {
-  constructor(context, store, findTaskOutput, index) {
+  // claimLiveOutput(rec): the file a running command's output is being written to, once known.
+  // label(rec): the name a command goes by in the lists.
+  constructor(context, store, findTaskOutput, index, claimLiveOutput, label) {
+    this.label = label;
     this.context = context;
     this.store = store;
     this.findTaskOutput = findTaskOutput;
     this.index = index;
+    this.claimLiveOutput = claimLiveOutput || (() => null);
     this.panel = null;
     this.selected = null;
     this.tailOffset = 0;
@@ -106,10 +112,27 @@ class Dashboard {
     this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
     this.panel.onDidDispose(() => {
       clearInterval(this.tailTimer);
+      clearTimeout(this.pushTimer);
+      this.pushTimer = null;
       this.panel = null;
       this.ready = false;
     });
+    // Nothing is sent to the page while its tab is hidden; it catches up when shown.
+    this.panel.onDidChangeViewState(() => {
+      if (this.panel && this.panel.visible && this.stale) this.sendState();
+    });
     this.tailTimer = setInterval(() => this.tail(), 500);
+  }
+
+  // The file a running or background command's output can be followed in.
+  outputFileOf(rec) {
+    if (rec.status === 'background' || (rec.background && rec.outputFile)) {
+      if (!rec.outputFile) rec.outputFile = this.findTaskOutput(rec.session, rec.backgroundTaskId);
+      return rec.outputFile || null;
+    }
+    // A regular command: Claude Code writes its output to a file while it runs.
+    if (rec.status === 'running' && Date.now() - rec.startTs > 1000) return this.claimLiveOutput(rec);
+    return null;
   }
 
   onMessage(msg) {
@@ -117,7 +140,7 @@ class Dashboard {
     switch (msg.type) {
       case 'ready':
         this.ready = true;
-        this.pushState();
+        this.sendState();
         if (this.pendingSession) this.panel.webview.postMessage({ type: 'filterSession', session: this.pendingSession });
         this.pendingSession = null;
         if (this.selected) this.sendOutput(true);
@@ -129,6 +152,12 @@ class Dashboard {
       case 'action':
         this.action(msg.action, rec);
         break;
+      case 'changeText': {
+        // The old and new text of an edit, for the change that is selected.
+        const ch = this.store.changes.get(msg.id);
+        if (ch) this.panel.webview.postMessage({ type: 'changeText', id: ch.id, oldString: clipPreview(ch.oldString), newString: clipPreview(ch.newString) });
+        break;
+      }
       case 'change': {
         const ch = this.store.changes.get(msg.id);
         const cmd = {
@@ -173,16 +202,34 @@ class Dashboard {
       chat: 'claudeCommandCenter.addCommandToChat',
       clear: 'claudeCommandCenter.clear',
       browser: 'claudeCommandCenter.openUrl',
+      setup: 'claudeCommandCenter.setup',
+      checkSetup: 'claudeCommandCenter.checkSetup',
     }[name];
     if (!cmd) return;
     if (rec) vscode.commands.executeCommand(cmd, rec);
     else vscode.commands.executeCommand(cmd);
   }
 
+  // Something changed. Several changes close together are sent as one update,
+  // and none while the tab is hidden.
   pushState() {
     if (!this.panel) return;
+    if (!this.ready || !this.panel.visible) {
+      this.stale = true;
+      return;
+    }
+    if (this.pushTimer) return;
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = null;
+      this.sendState();
+    }, 100);
+  }
+
+  sendState() {
+    if (!this.panel) return;
+    this.stale = false;
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.name);
-    const records = this.store.list().map(summarize);
+    const records = this.store.list().map((rec) => summarize(rec, this.label));
     const changes = this.store.listChanges().map(summarizeChange);
     // titles of the sessions shown, from Claude Code's transcripts
     const sessions = {};
@@ -198,6 +245,7 @@ class Dashboard {
       changes,
       sessions,
       scope: this.store.scope,
+      commandList: vscode.workspace.getConfiguration('claudeCommandCenter').get('commandList'),
       workspace: folders.join(', '),
     });
   }
@@ -212,13 +260,11 @@ class Dashboard {
     }
     let stdout = rec.stdout || '';
     this.tailOffset = 0;
-    if (rec.status === 'background' || (rec.background && rec.outputFile)) {
-      if (!rec.outputFile) rec.outputFile = this.findTaskOutput(rec.session, rec.backgroundTaskId);
-      if (rec.outputFile) {
-        const { text, size } = readFrom(rec.outputFile, 0, MAX_INITIAL_OUTPUT);
-        stdout = text;
-        this.tailOffset = size;
-      }
+    this.tailFile = this.outputFileOf(rec);
+    if (this.tailFile) {
+      const { text, size } = readFrom(this.tailFile, 0, MAX_INITIAL_OUTPUT);
+      stdout = text;
+      this.tailOffset = size;
     }
     this.panel.webview.postMessage({ type: 'output', id: rec.id, stdout, stderr: rec.stderr || '' });
   }
@@ -226,16 +272,19 @@ class Dashboard {
   tail() {
     if (!this.panel || !this.panel.visible) return;
     const rec = this.selected && this.store.records.get(this.selected);
-    if (!rec || rec.status !== 'background' || !rec.outputFile) return;
+    if (!rec || (rec.status !== 'background' && rec.status !== 'running')) return;
+    const file = this.outputFileOf(rec);
+    if (!file) return;
+    if (file !== this.tailFile) return this.sendOutput(); // the running command's file has just been found
     let size;
     try {
-      size = fs.statSync(rec.outputFile).size;
+      size = fs.statSync(file).size;
     } catch {
       return;
     }
     if (size < this.tailOffset) return this.sendOutput();
     if (size === this.tailOffset) return;
-    const { text } = readFrom(rec.outputFile, this.tailOffset, 1024 * 1024);
+    const { text } = readFrom(file, this.tailOffset, 1024 * 1024);
     this.tailOffset = size;
     this.panel.webview.postMessage({ type: 'append', id: rec.id, text });
   }
@@ -377,6 +426,13 @@ select { max-width: 170px; padding: 4px 6px; border-radius: 4px; border: 1px sol
 main { flex: 1; display: grid; grid-template-columns: minmax(280px, 38%) 1fr; min-height: 0; }
 .list { overflow-y: auto; border-right: 1px solid var(--border); }
 .group { position: sticky; top: 0; z-index: 1; background: var(--bg); padding: 8px 14px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+.group.sess { display: flex; gap: 8px; align-items: baseline; cursor: pointer; text-transform: none; letter-spacing: 0; font-size: 12px; padding: 8px 14px 6px; border-bottom: 1px solid var(--border); }
+.group.sess:hover .sess-facts { color: var(--fg); }
+.sess-name { color: var(--fg); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; min-width: 30%; }
+.sess-facts { flex: 1 1 0; min-width: 0; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.twist { color: var(--muted); font-size: 10px; align-self: center; }
+.row.quick .name { font-weight: 400; color: var(--muted); }
+.row.nested { padding-left: 30px; }
 .row { display: grid; grid-template-columns: 14px 1fr auto; gap: 4px 10px; align-items: start; padding: 8px 14px; cursor: pointer; border-left: 2px solid transparent; }
 .row:hover { background: var(--hover); }
 .row.sel { background: var(--sel); color: var(--sel-fg); border-left-color: var(--accent); }
@@ -435,6 +491,7 @@ pre.output .placeholder { color: var(--muted); font-style: italic; }
 `;
 
 const SCRIPT = `
+${grouping.source}
 const vscode = acquireVsCodeApi();
 const saved = vscode.getState() || {};
 let records = [];
@@ -450,14 +507,19 @@ let selectedChange = saved.selectedChange || null;
 let changeFilter = saved.changeFilter || 'all';
 let sessionFilter = saved.sessionFilter || null;
 let sessions = {};
+let changeText = { id: null }; // the selected edit's old and new text, sent on request
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-const save = () => vscode.setState({ selected, filter, project, follow, tab, selectedChange, changeFilter, sessionFilter });
+let listMode = 'grouped'; // or 'flat': the commandList setting
+const collapsed = new Set(saved.collapsed || []); // sessions folded in the list
+const openQuick = new Set(); // runs of quick commands that are unfolded
+const save = () => vscode.setState({ selected, filter, project, follow, tab, selectedChange, changeFilter, sessionFilter, collapsed: [...collapsed].slice(-200) });
 const sessionTitle = (id) => (sessions[id] && sessions[id].title) || (id ? id.slice(0, 8) : '—');
 const changeKind = (c) => (c.status === 'failed' ? 'failed' : c.created ? 'created' : 'edited');
 const CHANGE_LABEL = { edited: 'Edited', created: 'Created', failed: 'Failed', pending: 'Saving…' };
 
+const SETUP_BUTTONS = '<br><br><button class="btn" data-action="setup">Set up hooks</button> <button class="btn ghost" data-action="checkSetup" title="Find out why nothing shows up">Check setup</button>';
 const STATUS_LABEL = { running: 'Running', background: 'Background', ok: 'Done', failed: 'Failed', interrupted: 'Interrupted', stopped: 'Stopped', noresult: 'No result' };
 const isActive = (r) => r.status === 'running' || r.status === 'background';
 
@@ -470,6 +532,8 @@ function dur(ms) {
   return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
 }
 const time = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+// The time, with the date in front when it wasn't today.
+const when = (ts) => (new Date(ts).toDateString() === new Date().toDateString() ? time(ts) : new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time(ts));
 function dayLabel(ts) {
   const d = new Date(ts), today = new Date();
   const y = new Date(); y.setDate(today.getDate() - 1);
@@ -567,7 +631,7 @@ function renderChangeList() {
   const list = $('list');
   const rows = visibleChanges();
   if (!changes.length) {
-    list.innerHTML = '<div class="empty">No file changes recorded yet.<br>The hook needs <code>Edit|Write|MultiEdit|NotebookEdit</code> in its matcher (see README).</div>';
+    list.innerHTML = '<div class="empty">No file changes yet.<br>Every file Claude edits or creates shows up here, with a diff.' + SETUP_BUTTONS + '</div>';
     return;
   }
   if (!rows.length) {
@@ -591,9 +655,10 @@ function renderChangeList() {
 }
 
 function diffPreview(c) {
-  if (c.tool === 'Edit' && (c.oldString != null || c.newString != null)) {
+  if (c.tool === 'Edit' && c.hasText) {
+    if (changeText.id !== c.id) return '<div class="note">Loading…</div>';
     const lines = (s, cls, sign) => String(s || '').split(/\\r?\\n/).map((l) => '<span class="ln ' + cls + '">' + sign + ' ' + esc(l) + '</span>').join('');
-    return '<pre class="diff">' + lines(c.oldString, 'del', '-') + lines(c.newString, 'add', '+') +
+    return '<pre class="diff">' + lines(changeText.oldString, 'del', '-') + lines(changeText.newString, 'add', '+') +
       (c.replaceAll ? '<span class="sep">(replaced every occurrence)</span>' : '') + '</pre>';
   }
   if (c.status === 'failed') return '<div class="note">The edit failed, so the file was not changed.</div>';
@@ -642,6 +707,7 @@ function selectChange(id, openDiff) {
     save();
     renderChangeList();
     renderChangeDetail();
+    vscode.postMessage({ type: 'changeText', id });
   }
   const c = changes.find((x) => x.id === id);
   if (openDiff && c && c.status !== 'failed') vscode.postMessage({ type: 'change', action: 'diff', id });
@@ -690,28 +756,61 @@ function renderList() {
   const list = $('list');
   const rows = visible();
   if (!records.length) {
-    list.innerHTML = '<div class="empty">No commands recorded yet.<br>Once the hook is set up, every command Claude runs shows up here.<br><br>Events file: <code>~/.claude/command-center/log/events.jsonl</code></div>';
+    list.innerHTML = '<div class="empty">No commands yet.<br>Every command Claude runs shows up here, once setup is done and a new Claude Code session has started.' + SETUP_BUTTONS + '</div>';
     return;
   }
   if (!rows.length) {
     list.innerHTML = '<div class="empty">Nothing matches these filters.</div>';
     return;
   }
-  let html = '', lastDay = '';
-  for (const r of rows) {
-    const day = dayLabel(r.startTs);
-    if (day !== lastDay) { html += '<div class="group">' + esc(day) + '</div>'; lastDay = day; }
-    const meta = r.status === 'running' ? 'running ' + dur(elapsed(r))
-      : r.status === 'background' ? 'background'
-      : dur(elapsed(r));
-    html += '<div class="row s-' + r.status + (r.id === selected ? ' sel' : '') + '" data-id="' + esc(r.id) + '" tabindex="0" role="button">' +
-      '<span class="dot" title="' + esc(STATUS_LABEL[r.status] || r.status) + '"></span>' +
-      '<span class="name">' + esc(r.description || firstLine(r.command)) + '</span>' +
-      '<span class="meta">' + esc(meta) + ' · ' + esc(time(r.startTs)) + '</span>' +
-      '<span class="cmd">' + (r.project ? esc(r.project) + ' › ' : '') + esc(firstLine(r.command)) + '</span>' +
-      '</div>';
+  let html = '';
+  if (listMode !== 'grouped') {
+    let lastDay = '';
+    for (const r of rows) {
+      const day = dayLabel(r.startTs);
+      if (day !== lastDay) { html += '<div class="group">' + esc(day) + '</div>'; lastDay = day; }
+      html += rowHtml(r, false);
+    }
+  } else {
+    // Under their session, with runs of quick commands folded (as in the
+    // sidebar), unless a search or a filter is narrowing the list.
+    const folding = !query && filter === 'all';
+    for (const g of groupBySession(rows)) {
+      const open = !collapsed.has(g.id);
+      const running = g.records.filter(isActive).length;
+      const failed = g.records.filter((r) => r.status === 'failed').length;
+      const facts = [running ? running + ' running' : '', failed ? failed + ' failed' : '', g.records.length + (g.records.length === 1 ? ' command' : ' commands'), when(g.records[0].startTs)].filter(Boolean).join(' · ');
+      html += '<div class="group sess" data-sess="' + esc(g.id) + '" tabindex="0" role="button" aria-expanded="' + open + '" title="Click to fold or unfold this session">' +
+        '<span class="twist">' + (open ? '▾' : '▸') + '</span><span class="sess-name">' + esc(g.id ? sessionTitle(g.id) : 'Other commands') + '</span><span class="sess-facts">' + esc(facts) + '</span></div>';
+      if (!open) continue;
+      for (const item of folding ? foldQuick(g.records) : g.records) {
+        if (item.kind !== 'quick') { html += rowHtml(item, false); continue; }
+        const shown = openQuick.has(item.id);
+        html += '<div class="row quick" data-quick="' + esc(item.id) + '" tabindex="0" role="button" aria-expanded="' + shown + '" title="Commands that finished without an error in under 2 seconds">' +
+          '<span class="twist">' + (shown ? '▾' : '▸') + '</span>' +
+          '<span class="name">' + item.records.length + ' quick commands</span>' +
+          '<span class="meta">' + esc(when(item.records[0].startTs)) + '</span>' +
+          '<span class="cmd">' + esc(item.records.slice(0, 4).map((r) => r.label || firstLine(r.command)).join(', ')) + (item.records.length > 4 ? ', …' : '') + '</span>' +
+          '</div>';
+        if (shown) for (const r of item.records) html += rowHtml(r, true);
+      }
+    }
   }
   list.innerHTML = html;
+}
+
+// One row of the command list. data-start: the ticker at the end keeps a
+// running command's time current without redrawing the list.
+function rowHtml(r, nested) {
+  const meta = r.status === 'running' ? 'running ' + dur(elapsed(r))
+    : r.status === 'background' ? 'background'
+    : dur(elapsed(r));
+  return '<div class="row s-' + r.status + (r.id === selected ? ' sel' : '') + (nested ? ' nested' : '') + '" data-id="' + esc(r.id) + '" tabindex="0" role="button">' +
+    '<span class="dot" title="' + esc(STATUS_LABEL[r.status] || r.status) + '"></span>' +
+    '<span class="name">' + esc(r.label || r.description || firstLine(r.command)) + '</span>' +
+    '<span class="meta"' + (r.status === 'running' ? ' data-start="' + r.startTs + '"' : '') + '>' + esc(meta) + ' · ' + esc(listMode === 'grouped' ? when(r.startTs) : time(r.startTs)) + '</span>' +
+    '<span class="cmd">' + (r.project ? esc(r.project) + ' › ' : '') + esc(firstLine(r.command)) + '</span>' +
+    '</div>';
 }
 
 function renderDetail() {
@@ -725,7 +824,7 @@ function renderDetail() {
   const facts = [
     ['Tool', r.tool],
     ['Started', new Date(r.startTs).toLocaleString()],
-    ['Duration', r.status === 'background' ? 'still running' : dur(elapsed(r))],
+    ['Duration', r.status === 'background' ? 'still running' : dur(elapsed(r)), 'fact-duration'],
     r.exitCode != null ? ['Exit code', r.exitCode] : null,
     r.backgroundTaskId ? ['Task', r.backgroundTaskId] : null,
     ['Folder', r.cwd || '—'],
@@ -744,11 +843,11 @@ function renderDetail() {
         '<button class="btn ghost" data-action="copy">Copy</button>' +
         sessionButtons(r.session) +
       '</div></div>' +
-      '<div class="facts">' + facts.map(([k, v]) => '<div><span>' + esc(k) + '</span><b>' + esc(v) + '</b></div>').join('') + '</div>' +
+      '<div class="facts">' + facts.map(([k, v, id]) => '<div><span>' + esc(k) + '</span><b' + (id ? ' id="' + id + '"' : '') + '>' + esc(v) + '</b></div>').join('') + '</div>' +
       '<pre class="command">$ ' + esc(r.command) + '</pre>' +
     '</div>' +
     '<div class="out-bar">' +
-      (r.status === 'background' ? '<span class="live">Live</span>' : '<span>Output</span>') +
+      (isActive(r) ? '<span class="live">Live</span>' : '<span>Output</span>') +
       '<span class="grow"></span>' +
       '<label><input type="checkbox" id="follow"' + (follow ? ' checked' : '') + '> Follow</label>' +
     '</div>' +
@@ -766,7 +865,7 @@ function renderOutput() {
   if (output.stderr) html += (html ? '\\n' : '') + '<span class="stderr">' + ansi(output.stderr) + '</span>';
   if (!html) {
     html = '<span class="placeholder">' + (r.status === 'running'
-      ? 'Running… output appears when the command finishes.'
+      ? 'Running… waiting for output.'
       : r.status === 'background' ? 'Waiting for output…'
       : r.status === 'noresult' ? 'No result: the command was denied, cancelled or interrupted before it finished.' : 'No output.') + '</span>';
   }
@@ -809,6 +908,7 @@ function renderAll() {
 window.addEventListener('message', (e) => {
   const msg = e.data;
   if (msg.type === 'state') {
+    listMode = msg.commandList === 'flat' ? 'flat' : 'grouped';
     records = msg.records;
     changes = msg.changes || [];
     sessions = msg.sessions || {};
@@ -820,6 +920,9 @@ window.addEventListener('message', (e) => {
     sessionFilter = msg.session;
     save();
     setTab('commands');
+  } else if (msg.type === 'changeText') {
+    changeText = msg;
+    if (tab === 'changes' && msg.id === selectedChange) renderChangeDetail();
   } else if (msg.type === 'output' && msg.id === selected) {
     output = msg;
     renderOutput();
@@ -834,8 +937,13 @@ window.addEventListener('message', (e) => {
   }
 });
 
+const toggle = (set, id) => (set.has(id) ? set.delete(id) : set.add(id));
+
 document.addEventListener('click', (e) => {
+  const sess = e.target.closest('.group.sess');
+  if (sess) { toggle(collapsed, sess.dataset.sess); save(); return renderList(); }
   const row = e.target.closest('.row');
+  if (row && row.dataset.quick) { toggle(openQuick, row.dataset.quick); return renderList(); }
   if (row) return tab === 'changes' ? selectChange(row.dataset.id, true) : select(row.dataset.id);
   const tabBtn = e.target.closest('#tabs button');
   if (tabBtn) return setTab(tabBtn.dataset.tab);
@@ -880,7 +988,8 @@ function setFilter(f) {
 
 document.addEventListener('keydown', (e) => {
   if (e.target.id === 'search') return;
-  const rows = [...document.querySelectorAll('.row')];
+  if (e.key === 'Enter' && (e.target.dataset.quick || e.target.classList.contains('sess'))) return e.target.click();
+  const rows = [...document.querySelectorAll('.row[data-id]')];
   const cur = tab === 'changes' ? selectedChange : selected;
   const pick = (id) => (tab === 'changes' ? selectChange(id, false) : select(id));
   const i = rows.findIndex((r) => r.dataset.id === cur);
@@ -897,21 +1006,23 @@ $('search').addEventListener('input', (e) => { query = e.target.value; renderLis
 $('project').addEventListener('change', (e) => { project = e.target.value; save(); renderList(); });
 document.querySelectorAll('#filter button').forEach((b) => b.classList.toggle('on', b.dataset.f === filter));
 
-// keep running timers fresh
+// Keep the times of running commands current. Only their text is changed:
+// redrawing the list would drop the keyboard focus and the hover every second.
 setInterval(() => {
-  if (records.some(isActive)) {
-    renderList();
-    const r = records.find((x) => x.id === selected);
-    if (r && r.status === 'running') {
-      const facts = document.querySelectorAll('.facts b');
-      if (facts[2]) facts[2].textContent = dur(elapsed(r));
-    }
-  }
+  const now = Date.now();
+  document.querySelectorAll('.meta[data-start]').forEach((el) => {
+    const start = Number(el.dataset.start);
+    el.textContent = 'running ' + dur(now - start) + ' · ' + time(start);
+  });
+  const r = tab === 'commands' && records.find((x) => x.id === selected);
+  const fact = document.getElementById('fact-duration');
+  if (r && r.status === 'running' && fact) fact.textContent = dur(elapsed(r));
 }, 1000);
 
 setTab(tab);
 vscode.postMessage({ type: 'ready' });
 if (selected) vscode.postMessage({ type: 'select', id: selected });
+if (selectedChange) vscode.postMessage({ type: 'changeText', id: selectedChange });
 `;
 
-module.exports = { Dashboard, folderLabel };
+module.exports = { Dashboard, folderLabel, SCRIPT };

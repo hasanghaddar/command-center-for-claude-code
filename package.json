@@ -2,7 +2,7 @@
   "name": "command-center-for-claude-code",
   "displayName": "Command Center for Claude Code",
   "description": "Watch, control and feed context to Claude Code: live commands and logs, diffs of every edit, stop background processes, sessions you can resume or move between projects, notifications, token usage, and @-mention files, selections and terminal output. Unofficial; not affiliated with Anthropic.",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "publisher": "hynexia",
   "author": {
     "name": "Hynexia",
@@ -84,11 +84,23 @@
     "viewsWelcome": [
       {
         "view": "claudeCommandCenter.commands",
-        "contents": "No commands recorded yet.\n\n[Set up hooks](command:claudeCommandCenter.setup)\n\nThen start a new Claude Code session and let Claude run a command.\n\nAlready set up and still nothing here?\n[Check setup](command:claudeCommandCenter.checkSetup)\n[Open dashboard](command:claudeCommandCenter.dashboard)\n[Open live feed](command:claudeCommandCenter.openFeed)"
+        "when": "!claudeCommandCenter.hookReady",
+        "contents": "No commands recorded yet.\n\n[Set up hooks](command:claudeCommandCenter.setup)\n\nThen start a new Claude Code session and let Claude run a command.\n\nAlready set up and still nothing here?\n[Check setup](command:claudeCommandCenter.checkSetup)"
+      },
+      {
+        "view": "claudeCommandCenter.commands",
+        "when": "claudeCommandCenter.hookReady",
+        "contents": "No commands yet.\n\nSetup is done. Commands appear here when Claude runs them, in Claude Code sessions started since setup.\n\nNothing after Claude has run something?\n[Check setup](command:claudeCommandCenter.checkSetup)\n[Open dashboard](command:claudeCommandCenter.dashboard)"
       },
       {
         "view": "claudeCommandCenter.changes",
-        "contents": "No file changes recorded yet.\n\nEvery file Claude edits shows up here, with a diff.\n[Set up hooks](command:claudeCommandCenter.setup)\n[Check setup](command:claudeCommandCenter.checkSetup)"
+        "when": "!claudeCommandCenter.hookReady",
+        "contents": "No file changes recorded yet.\n\nEvery file Claude edits shows up here, with a diff.\n[Set up hooks](command:claudeCommandCenter.setup)"
+      },
+      {
+        "view": "claudeCommandCenter.changes",
+        "when": "claudeCommandCenter.hookReady",
+        "contents": "No file changes yet.\n\nEvery file Claude edits shows up here, with a diff."
       },
       {
         "view": "claudeCommandCenter.sessions",
@@ -344,7 +356,7 @@
         },
         {
           "command": "claudeCommandCenter.addTerminalToChat",
-          "when": "view == terminal",
+          "when": "view == terminal && config.claudeCommandCenter.terminalButton",
           "group": "navigation@0"
         },
         {
@@ -401,17 +413,17 @@
         },
         {
           "command": "claudeCommandCenter.open",
-          "when": "view == claudeCommandCenter.commands",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc/",
           "group": "inline@2"
         },
         {
           "command": "claudeCommandCenter.copyCommand",
-          "when": "view == claudeCommandCenter.commands",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc/",
           "group": "1_actions@1"
         },
         {
           "command": "claudeCommandCenter.runInTerminal",
-          "when": "view == claudeCommandCenter.commands",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc/",
           "group": "1_actions@2"
         },
         {
@@ -421,7 +433,7 @@
         },
         {
           "command": "claudeCommandCenter.addCommandToChat",
-          "when": "view == claudeCommandCenter.commands",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc/",
           "group": "1_actions@0"
         },
         {
@@ -556,13 +568,48 @@
         },
         {
           "command": "claudeCommandCenter.showInTranscript",
-          "when": "view == claudeCommandCenter.commands",
+          "when": "view == claudeCommandCenter.commands && viewItem =~ /^proc/",
           "group": "1_actions@4"
         },
         {
           "command": "claudeCommandCenter.showInTranscript",
           "when": "view == claudeCommandCenter.changes",
           "group": "2_session@0"
+        },
+        {
+          "command": "claudeCommandCenter.viewTranscript",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "inline@0"
+        },
+        {
+          "command": "claudeCommandCenter.openSession",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "1_open@0"
+        },
+        {
+          "command": "claudeCommandCenter.viewTranscript",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "1_open@1"
+        },
+        {
+          "command": "claudeCommandCenter.showSessionCommands",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "1_open@2"
+        },
+        {
+          "command": "claudeCommandCenter.sessionDiff",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "4_changes@1"
+        },
+        {
+          "command": "claudeCommandCenter.revertLastTurn",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "4_changes@2"
+        },
+        {
+          "command": "claudeCommandCenter.copySessionId",
+          "when": "view == claudeCommandCenter.commands && viewItem == cmdSession",
+          "group": "9_info@1"
         }
       ],
       "commandPalette": [
@@ -695,13 +742,18 @@
         "claudeCommandCenter.autoOpenForeground": {
           "type": "boolean",
           "default": true,
-          "description": "Open a terminal tab whenever Claude starts a regular (foreground) command. Its output streams live. Tabs of finished commands close when the next one opens; reopen them from the dashboard or Commands view. While you are on a terminal of your own, new tabs open in the terminal list without coming to the front; select one of Claude's tabs to follow them again."
+          "description": "Open a terminal tab whenever Claude starts a regular (foreground) command. Its output streams live. Tabs of finished commands close when the next one opens; reopen them from the dashboard or Commands view. The tab waits in the terminal list unless \"revealTabs\" is on."
         },
         "claudeCommandCenter.autoOpenDelay": {
           "type": "number",
           "default": 2,
           "minimum": 0,
           "description": "Seconds a regular command must have been running before its terminal tab opens, so quick commands (git status, ls, …) don't flash a tab open. Their output is still in the Commands view and dashboard. 0 opens a tab for every command right away."
+        },
+        "claudeCommandCenter.revealTabs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bring the tab of a command Claude starts to the front, opening the terminal panel if it is closed. Off: tabs open in the terminal list without showing, the status bar names the running command, and clicking that opens its tab."
         },
         "claudeCommandCenter.commandTabs": {
           "type": "string",
@@ -724,7 +776,7 @@
         "claudeCommandCenter.resourceUsage": {
           "type": "boolean",
           "default": true,
-          "description": "Show the CPU and memory of commands Claude is running. Measured only while this window is focused and the Commands view or the command's tab is showing, every 10 seconds or less often on Windows (each reading costs about half a second of CPU there) and every 3 seconds on macOS and Linux."
+          "description": "Show the CPU and memory of commands Claude is running. Measured only while this window is focused and the Commands view or the command's tab is showing: every 10 seconds or less often on Windows (where one PowerShell process is kept open while it measures) and every 3 seconds on macOS and Linux."
         },
         "claudeCommandCenter.scope": {
           "type": "string",
@@ -745,6 +797,19 @@
           "minimum": 0,
           "description": "Delete the before/after snapshots of Claude's file edits after this many days. 0 keeps them forever. Diffs of older changes stop working once their snapshots are gone."
         },
+        "claudeCommandCenter.historyDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "scope": "application",
+          "description": "Delete recorded commands, their output and the list of file changes after this many days. 0 keeps them until the history reaches its size limit (about 40 MB)."
+        },
+        "claudeCommandCenter.maskSecrets": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Mask secrets before a command or its output is recorded: passwords in URLs, Authorization headers, values of settings named like a secret (API_KEY=…, --password …), keys recognisable by their shape, and private keys. \"Run Again in My Terminal\" then pastes the masked command."
+        },
         "claudeCommandCenter.chatFileRetentionHours": {
           "type": "number",
           "default": 24,
@@ -754,7 +819,20 @@
         "claudeCommandCenter.maxItems": {
           "type": "number",
           "default": 200,
-          "description": "Maximum number of commands shown in the list."
+          "description": "Maximum number of commands, file changes and sessions shown in each list."
+        },
+        "claudeCommandCenter.commandList": {
+          "type": "string",
+          "enum": [
+            "grouped",
+            "flat"
+          ],
+          "enumDescriptions": [
+            "Commands under the session that ran them, with runs of quick successful ones (git status, ls, …) folded into one row",
+            "One list of every command, newest first"
+          ],
+          "default": "grouped",
+          "description": "How the Commands view lists commands."
         },
         "claudeCommandCenter.logDir": {
           "type": "string",
@@ -774,7 +852,7 @@
             "Never"
           ],
           "default": "unfocused",
-          "description": "Notify when Claude finishes a turn and waits for you, in a project open in this window."
+          "description": "Notify when Claude finishes a turn and waits for you, in a project open in this window. A notification raised while the window has no focus is shown when you come back to it, if it still applies."
         },
         "claudeCommandCenter.notifyAttention": {
           "type": "string",
@@ -789,7 +867,7 @@
             "Never"
           ],
           "default": "unfocused",
-          "description": "Notify when Claude needs permission or an answer before it can continue."
+          "description": "Notify when Claude needs permission or an answer before it can continue. Unless this is \"never\", the status bar also shows \"Claude needs you\" until the session carries on."
         },
         "claudeCommandCenter.notifySubagentEnd": {
           "type": "string",
@@ -818,10 +896,20 @@
           "minimum": 0,
           "description": "Only notify about subagents that ran at least this many seconds."
         },
+        "claudeCommandCenter.systemNotifications": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also show a notification from the operating system when Claude finishes or needs you while this window isn't the one in front, so you see it from another app. On Windows, clicking it brings the project's window forward. Uses PowerShell on Windows, osascript on macOS and notify-send on Linux."
+        },
         "claudeCommandCenter.showUsage": {
           "type": "boolean",
           "default": true,
-          "description": "Show the tokens Claude Code used in the last 5 hours in the status bar (counted from local transcripts; hover for today and 7 days)."
+          "description": "Show the tokens Claude Code used in the last 5 hours in the Command Center status bar item (counted from local transcripts; hover for today and 7 days)."
+        },
+        "claudeCommandCenter.terminalButton": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the @ button in the terminal toolbar (Add to Claude Chat: the selection, or the last command's output). The same actions stay in the terminal's right-click menu."
         },
         "claudeCommandCenter.sessionDays": {
           "type": "number",
@@ -842,7 +930,7 @@
             "Never"
           ],
           "default": "always",
-          "description": "Offer to open a dev server when a background process Claude started prints a local URL (http://localhost:…)."
+          "description": "Offer to open a dev server when a background process Claude started prints a local URL (http://localhost:…). \"Don't Offer Again\" on the notification turns it off for that address in this workspace."
         },
         "claudeCommandCenter.answerPermissions": {
           "type": "boolean",
@@ -862,6 +950,7 @@
   "scripts": {
     "vscode:uninstall": "node ./uninstall.js",
     "test": "node --test --test-force-exit --test-timeout=30000 \"test/*.test.js\"",
+    "test:vscode": "node test/real-vscode/run.js",
     "package": "npx --yes @vscode/vsce package",
     "publish:vscode": "npx --yes @vscode/vsce publish",
     "publish:openvsx": "npx --yes ovsx publish"

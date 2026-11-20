@@ -7,11 +7,16 @@
 // It never blocks the tool call: it always exits 0, and prints nothing except
 // a permission decision made in VS Code (see askVsCode).
 
-const cp = require('child_process');
-const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+// Loaded when first used: most calls never start git or hash a file.
+const lazy = (name) => {
+  let m;
+  return () => m || (m = require(name));
+};
+const cp = lazy('child_process');
+const crypto = lazy('crypto');
 
 const LOG_DIR =
   process.env.CLAUDE_COMMAND_CENTER_LOG_DIR ||
@@ -25,6 +30,81 @@ function clip(value) {
   if (value.length <= MAX_OUTPUT) return value;
   return value.slice(0, MAX_OUTPUT / 2) + '\n\n… [output truncated by process monitor] …\n\n' + value.slice(-MAX_OUTPUT / 2);
 }
+
+// ---------------------------------------------------------------------------
+// Secrets are masked before anything is written: passwords in URLs,
+// Authorization headers, values of settings named like a secret
+// (API_KEY=…, --password …, "token": "…"), keys recognisable by their shape,
+// and private keys. In a command every such value is masked. In output and
+// in edited text, where the same words appear in ordinary code
+// (password: req.body.password), a named value is masked only if it looks like
+// a secret: six characters or more, with both letters and digits.
+// Turned off with the extension's maskSecrets setting (config.json).
+// ---------------------------------------------------------------------------
+
+const HOME = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'command-center');
+
+// Written by the extension from its settings; without it the defaults apply.
+function readConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(HOME, 'config.json'), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+const MASK = '***';
+const SECRET_NAME = String.raw`[A-Za-z0-9_-]{0,40}(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key)`;
+const SECRET_VALUE = String.raw`"[^"\n]{1,500}"|'[^'\n]{1,500}'|[^\s"',;&|)]{1,500}`;
+// Never masked: variables ($TOKEN, ${TOKEN}, %TOKEN%, $env:TOKEN, {{ … }},
+// $(…)), placeholders (<token>), and what is masked already.
+const NOT_A_VALUE = /^(?:\*+|<[^>]*>|\$\{?[\w:.]+\}?|%\w+%|\{\{.*|\$\(.*)$/;
+// After a name (DEBUG_TOKEN=true, max_token: 5), these aren't secrets either.
+// Where a password is expected (user:1234@host), anything is one.
+const PLAIN_VALUE = /^(?:true|false|null|none|undefined|yes|no|\d{1,6})$/i;
+const LOOKS_SECRET = /^(?=.*\d)(?=.*[A-Za-z])[^\s(]{6,}$/;
+const TOKEN_SHAPES =
+  /\b(?:sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g;
+const PRIVATE_KEY = /-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----[\s\S]{1,10000}?-----END [A-Z ]{0,30}PRIVATE KEY-----/g;
+
+// A replacer for rules of the form (what comes before)(the value).
+// named: the value follows a name, rather than standing where a password goes.
+const masker = (named, always) => (match, before, value) => {
+  const quote = /^["']/.test(value) ? value[0] : '';
+  const bare = quote ? value.slice(1, -1) : value;
+  if (NOT_A_VALUE.test(bare)) return match;
+  if (named && (PLAIN_VALUE.test(bare) || !(always || LOOKS_SECRET.test(bare)))) return match;
+  return before + quote + MASK + quote;
+};
+
+// [pattern, false if the value follows a name: those are masked without
+// exception only in a command]
+const SECRET_RULES = [
+  // scheme://user:password@host
+  [/\b([a-z][a-z0-9+.-]{1,20}:\/\/[^\s:@\/'"]{1,100}:)([^\s@\/'"]{1,200})(?=@)/gi, true],
+  // Authorization: Bearer …
+  [/\b((?:proxy-)?authorization["']?\s*[:=]\s*["']?(?:(?:bearer|basic|token|digest|negotiate)\s+)?)([^\s"',;]{6,500})/gi, true],
+  // NAME=value, name: value, "name": "value", $env:NAME = "value", --name=value
+  [new RegExp(String.raw`\b(${SECRET_NAME}["']?\s*[:=]\s*)(${SECRET_VALUE})`, 'gi'), false],
+  // --name value
+  [new RegExp(String.raw`(--${SECRET_NAME}\s+)(?![<>|&-])(${SECRET_VALUE})`, 'gi'), false],
+  // curl -u user:password, mysql -pPassword, sshpass -p password
+  [/(\s(?:-u|--user)\s+["']?[^\s:"']{1,100}:)([^\s"']{1,200})/g, true],
+  [/(\bmysql(?:dump|admin)?\b[^\n|;&]{0,200}?\s-p)([^\s-]\S{0,200})/g, true],
+  [/(\bsshpass\s+-p\s*)(\S{1,200})/g, true],
+];
+
+// command: the text is a command line (see above).
+function redact(text, command = false) {
+  if (typeof text !== 'string' || text.length < 8) return text;
+  let out = text.replace(PRIVATE_KEY, `-----BEGIN PRIVATE KEY----- ${MASK} -----END PRIVATE KEY-----`);
+  for (const [pattern, positional] of SECRET_RULES) out = out.replace(pattern, masker(!positional, command));
+  return out.replace(TOKEN_SHAPES, MASK);
+}
+
+// Set from config.json when the hook runs.
+let masking = true;
+const secret = (text, command) => (masking ? redact(text, command) : text);
 
 function rotateIfLarge() {
   try {
@@ -66,8 +146,8 @@ function buildFileEvent(input, base) {
     const before = snapshot(base.id, file, 'before');
     const ev = { ...base, type: 'fileStart', file, cwd: input.cwd, existed: before.exists, before: before.path, tooLarge: before.tooLarge };
     if (input.tool_name === 'Edit') {
-      ev.oldString = snippet(ti.old_string);
-      ev.newString = snippet(ti.new_string);
+      ev.oldString = secret(snippet(ti.old_string));
+      ev.newString = secret(snippet(ti.new_string));
       ev.replaceAll = !!ti.replace_all;
     } else if (input.tool_name === 'MultiEdit' && Array.isArray(ti.edits)) {
       ev.edits = ti.edits.length;
@@ -77,7 +157,7 @@ function buildFileEvent(input, base) {
   const failed = input.hook_event_name === 'PostToolUseFailure';
   const after = failed ? {} : snapshot(base.id, file, 'after');
   const ev = { ...base, type: 'fileEnd', file, failed, after: after.path, tooLarge: after.tooLarge };
-  if (failed && input.error) ev.error = clip(typeof input.error === 'string' ? input.error : JSON.stringify(input.error));
+  if (failed && input.error) ev.error = secret(clip(typeof input.error === 'string' ? input.error : JSON.stringify(input.error)));
   return ev;
 }
 
@@ -95,8 +175,9 @@ const MAX_DIRTY_BYTES = 50 * 1024 * 1024;
 const MAX_SHELL_CHANGES = 200;
 const STALE_STATE_MS = 24 * 60 * 60 * 1000;
 
+// --no-optional-locks: never write the index, so this can't get in the way of a git command Claude runs.
 function git(cwd, args) {
-  return cp.execFileSync('git', args, { cwd, windowsHide: true, timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+  return cp().execFileSync('git', ['--no-optional-locks', ...args], { cwd, windowsHide: true, timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
 }
 
 // Setup steps in front of the real command that don't change the folder:
@@ -113,9 +194,10 @@ const SETUP_STEPS = [
 ].map((p) => new RegExp(String.raw`^\s*${p}${END}`, 'i'));
 const LEADING_CD = new RegExp(String.raw`^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))${END}`);
 
-// Where the command runs: the session's folder, or the one the leading
-// `cd <dir> &&` / `cd <dir>;` steps move to, past any setup steps.
-function shellDir(input) {
+// Where the command runs (the session's folder, or the one the leading
+// `cd <dir> &&` / `cd <dir>;` steps move to, past any setup steps) and what
+// is left of the command after those steps.
+function shellTarget(input) {
   let dir = input.cwd || process.cwd();
   let cmd = (input.tool_input || {}).command || '';
   for (let more = true; more; ) {
@@ -136,27 +218,183 @@ function shellDir(input) {
       }
     }
   }
-  return dir;
+  return { dir, rest: cmd };
 }
 
-// Paths (relative to the repo root) that differ from HEAD or the index,
-// untracked ones included.
-function gitDirtyPaths(root) {
-  const out = git(root, ['status', '--porcelain=v1', '-z', '-uall']).toString('utf8').split('\0');
+// ---------------------------------------------------------------------------
+// Commands that can't change files (`ls`, `cat`, `grep`, `git status`, …)
+// are not compared before and after, which saves starting git twice for most
+// of what Claude runs. A command counts only if every step of it is on the
+// list and nothing is written to a file; anything not understood is compared
+// as before.
+// ---------------------------------------------------------------------------
+
+const READ_ONLY = new Set(
+  (
+    'ls dir cat head tail wc pwd echo printf which where whereis type whoami id date hostname uname ' +
+    'grep egrep fgrep rg ag tree stat file du df basename dirname realpath readlink cut tr nl tac diff cmp jq ' +
+    'test [ true false sleep cd pushd popd export printenv column sha1sum sha256sum md5sum ps ' +
+    // PowerShell
+    'get-childitem gci get-content gc select-string sls get-location gl test-path get-item gi resolve-path ' +
+    'split-path join-path get-command gcm get-process gps get-date write-output write-host measure-object ' +
+    'select-object select where-object sort-object format-table ft format-list fl out-string get-filehash ' +
+    'set-location sl push-location pop-location'
+  ).split(' ')
+);
+const READ_ONLY_GIT = new Set(
+  'status log diff show rev-parse rev-list ls-files ls-tree blame describe cat-file grep shortlog reflog branch remote tag merge-base name-rev show-ref for-each-ref version'.split(' ')
+);
+// PowerShell words that change something, wherever they appear (a script block, say).
+const POWERSHELL_WRITES = /^(remove-|set-(?!location)|new-|move-|copy-|rename-|clear-|add-|out-file|export-|invoke-|start-|stop-|tee-|foreach-object$|rm$|del$|ri$|mv$|cp$|ni$|iex$|sc$|ac$|%$)/i;
+// Where output may be redirected without writing a file.
+const NO_FILE = /^(&[0-9-]|\/dev\/null|\$null|nul)$/i;
+
+// Where the quoted string opening at `from` closes, or -1.
+function closingQuote(command, from, powershell) {
+  const quote = command[from];
+  for (let j = from + 1; j < command.length; j++) {
+    if (command[j] === '\\' && quote === '"' && !powershell) j++;
+    else if (command[j] === quote) return j;
+  }
+  return -1;
+}
+
+// The command line as steps (split at ; && || | and new lines), each a list of
+// words with their quotes removed. null when it contains something this
+// doesn't follow: command substitution, a here-document, a background `&`, or
+// output redirected to a file.
+function splitSteps(command, powershell) {
+  const steps = [];
+  let words = [];
+  let word = null;
+  const endWord = () => {
+    if (word !== null) words.push(word);
+    word = null;
+  };
+  const endStep = () => {
+    endWord();
+    if (words.length) steps.push(words);
+    words = [];
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (ch === "'" || ch === '"') {
+      const end = closingQuote(command, i, powershell);
+      if (end < 0) return null;
+      const inner = command.slice(i + 1, end);
+      if (ch === '"' && /`|\$\(/.test(inner)) return null; // runs a command
+      word = (word || '') + inner;
+      i = end;
+    } else if (ch === '\n' || ch === ';') {
+      endStep();
+    } else if (ch === ' ' || ch === '\t' || ch === '\r') {
+      endWord();
+    } else if (ch === '|') {
+      endStep();
+      if (next === '|' || next === '&') i++;
+    } else if (ch === '&') {
+      if (next === '&') {
+        endStep();
+        i++;
+      } else if (next !== '>') return null; // run in the background
+    } else if (ch === '>') {
+      if (word !== null && /^\d+$/.test(word)) word = null; // 2>
+      endWord();
+      let j = i + 1;
+      if (command[j] === '>') j++;
+      if (command[j] === '|') j++;
+      while (command[j] === ' ') j++;
+      const m = /^[^\s;|<>]+/.exec(command.slice(j));
+      if (!m || !NO_FILE.test(m[0].replace(/^["']|["']$/g, ''))) return null; // writes a file
+      i = j + m[0].length - 1;
+    } else if (ch === '<') {
+      if (next === '<' || next === '(') return null;
+      endWord(); // reads a file
+    } else if (ch === '`' || (ch === '$' && next === '(')) {
+      return null;
+    } else if (ch === '#' && word === null) {
+      while (i + 1 < command.length && command[i + 1] !== '\n') i++; // a comment
+    } else if (ch === '\\' && !powershell && next !== undefined) {
+      word = (word || '') + next;
+      i++;
+    } else {
+      word = (word || '') + ch;
+    }
+  }
+  endStep();
+  return steps;
+}
+
+function readOnlyGit(args) {
+  let i = 0;
+  while (i < args.length && args[i].startsWith('-') && args[i] !== '--version') i += args[i] === '-C' || args[i] === '-c' ? 2 : 1;
+  const sub = args[i];
+  if (sub === '--version') return true;
+  if (!READ_ONLY_GIT.has(sub)) return false;
+  return !args.slice(i + 1).some((a) => a.startsWith('--output'));
+}
+
+function readOnlyStep(words, powershell) {
+  if (powershell && words.some((w) => POWERSHELL_WRITES.test(w))) return false;
+  const cmd = words[0].replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
+  const args = words.slice(1);
+  if (cmd === 'git') return readOnlyGit(args);
+  if (cmd === 'find') return !args.some((a) => /^-(delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
+  if (cmd === 'sed') return args.includes('-n') && !args.some((a) => /^-[a-z]*i|^--in-place/i.test(a)); // printing lines
+  if (cmd === 'sort') return !args.some((a) => /^(-o|--output)/.test(a));
+  if (cmd === 'command') return args[0] === '-v' || args[0] === '-V';
+  return READ_ONLY.has(cmd);
+}
+
+function readOnly(command, tool) {
+  const powershell = tool === 'PowerShell';
+  const steps = splitSteps(String(command || ''), powershell);
+  return !!steps && steps.length > 0 && steps.every((words) => readOnlyStep(words, powershell));
+}
+
+// The repository a folder is in: the nearest folder up from it that has a
+// `.git` (a folder, or a file in a worktree or submodule). Found without
+// starting git, so a folder outside any repository costs nothing.
+function repoRoot(dir) {
+  for (let d = path.resolve(dir); ; ) {
+    if (fs.existsSync(path.join(d, '.git'))) return d;
+    const up = path.dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
+}
+
+// What follows the first n space-separated fields of a status line.
+function afterFields(line, n) {
+  let at = 0;
+  for (; n > 0; n--) at = line.indexOf(' ', at) + 1;
+  return line.slice(at);
+}
+
+// From one `git status`: HEAD (null before the first commit) and the paths,
+// relative to the repo root, that differ from it or the index, untracked ones
+// included.
+function gitState(root) {
+  const out = git(root, ['status', '--porcelain=v2', '--branch', '-z', '-uall']).toString('utf8').split('\0');
+  let head = null;
   const paths = [];
   for (let i = 0; i < out.length; i++) {
     const e = out[i];
-    if (e.length < 4) continue;
-    paths.push(e.slice(3));
-    if (e[0] === 'R' || e[0] === 'C') paths.push(out[++i]); // the rename's source
+    if (e.startsWith('# branch.oid ')) {
+      if (/^[0-9a-f]{40,64}$/.test(e.slice(13))) head = e.slice(13);
+    } else if (e[0] === '1') paths.push(afterFields(e, 8));
+    else if (e[0] === '2') paths.push(afterFields(e, 9), out[++i]); // renamed or copied: the new path, then its source
+    else if (e[0] === 'u') paths.push(afterFields(e, 10));
+    else if (e[0] === '?') paths.push(e.slice(2));
   }
-  return paths;
+  return { head, paths: paths.filter(Boolean) };
 }
 
 // Store contents once per hash, keeping the extension so diffs get the right
 // language. Reusing a copy refreshes its age so it isn't pruned while in use.
 function storeBlob(buf, file) {
-  const dest = path.join(SNAPSHOT_DIR, `blob-${crypto.createHash('sha1').update(buf).digest('hex')}${path.extname(file)}`);
+  const dest = path.join(SNAPSHOT_DIR, `blob-${crypto().createHash('sha1').update(buf).digest('hex')}${path.extname(file)}`);
   try {
     const now = new Date();
     fs.utimesSync(dest, now, now);
@@ -169,21 +407,48 @@ function storeBlob(buf, file) {
 
 const shellStateFile = (id) => path.join(SHELL_STATE_DIR, `${id.replace(/[^\w.-]/g, '_')}.json`);
 
+// Mid-task a repository has many files that differ from the last commit, and
+// every command would read and hash all of them again. The copies made last
+// time are remembered per repository, and reused for files whose size and
+// time haven't changed since.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const copiesFile = (root) => path.join(SHELL_STATE_DIR, `copies-${root.replace(/[^\w.-]/g, '_').slice(-150)}.json`);
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// The remembered copy of a file, if it is still the same file and the copy still exists.
+function knownCopy(was, st, now) {
+  if (!was || !was.blob || was.size !== st.size || was.mtime !== st.mtimeMs || !fs.existsSync(was.blob)) return null;
+  if (now - was.touched > DAY_MS / 2) {
+    try {
+      fs.utimesSync(was.blob, new Date(now), new Date(now)); // in use: not to be cleaned up as old
+      was.touched = now;
+    } catch {
+      return null;
+    }
+  }
+  return was;
+}
+
 function shellBefore(input) {
   const ti = input.tool_input || {};
-  if (!input.tool_use_id || ti.run_in_background) return; // a background task changes files after its hook has run
-  let root;
-  try {
-    root = git(shellDir(input), ['rev-parse', '--show-toplevel']).toString('utf8').trim();
-  } catch {
-    return; // not in a git repo, or no git
-  }
-  let head = null;
-  try {
-    head = git(root, ['rev-parse', '--verify', '-q', 'HEAD']).toString('utf8').trim();
-  } catch {}
-  const paths = gitDirtyPaths(root);
+  if (!input.tool_use_id || ti.run_in_background || isMonitor(input)) return; // a background task changes files after its hook has run
+  const { dir, rest } = shellTarget(input);
+  if (readOnly(rest, input.tool_name)) return; // it can't change files
+  const root = repoRoot(dir);
+  if (!root) return; // not in a git repo
+  const { head, paths } = gitState(root); // throws without git: nothing is tracked
   if (paths.length > MAX_DIRTY) return;
+  const now = Date.now();
+  const before = readJson(copiesFile(root));
+  const known = before || {};
+  const copies = {};
   const dirty = {};
   let bytes = 0;
   for (const rel of paths) {
@@ -194,7 +459,9 @@ function shellBefore(input) {
       const entry = { size: st.size, mtime: st.mtimeMs };
       if (st.size > MAX_SNAPSHOT || bytes + st.size > MAX_DIRTY_BYTES) entry.tooLarge = true;
       else {
-        entry.blob = storeBlob(fs.readFileSync(file), file);
+        const copy = knownCopy(known[rel], st, now) || { size: st.size, mtime: st.mtimeMs, blob: storeBlob(fs.readFileSync(file), file), touched: now };
+        copies[rel] = copy;
+        entry.blob = copy.blob;
         bytes += st.size;
       }
       dirty[rel] = entry;
@@ -203,7 +470,9 @@ function shellBefore(input) {
     }
   }
   fs.mkdirSync(SHELL_STATE_DIR, { recursive: true });
-  fs.writeFileSync(shellStateFile(input.tool_use_id), JSON.stringify({ root, head, ts: Date.now(), dirty }));
+  fs.writeFileSync(shellStateFile(input.tool_use_id), JSON.stringify({ root, head, ts: now, dirty }));
+  const remembered = JSON.stringify(copies);
+  if (remembered !== JSON.stringify(before)) fs.writeFileSync(copiesFile(root), remembered);
   // State left by calls that never finished (denied, or Claude Code quit).
   try {
     for (const n of fs.readdirSync(SHELL_STATE_DIR)) {
@@ -225,19 +494,16 @@ function shellAfter(input, base) {
     return [];
   }
   const { root, head, dirty } = state;
-  const candidates = new Set([...Object.keys(dirty), ...gitDirtyPaths(root)]);
+  const now = gitState(root);
+  const candidates = new Set([...Object.keys(dirty), ...now.paths]);
   // A commit or checkout during the command: files may now match the new HEAD
   // but still differ from the one before.
-  let headNow = null;
-  try {
-    headNow = git(root, ['rev-parse', '--verify', '-q', 'HEAD']).toString('utf8').trim();
-  } catch {}
-  if (head && headNow !== head) {
+  if (head && now.head !== head) {
     for (const rel of git(root, ['diff', '--name-only', '-z', head]).toString('utf8').split('\0')) if (rel) candidates.add(rel);
   }
 
   const ti = input.tool_input || {};
-  const via = ti.description || String(ti.command || '').split('\n')[0];
+  const via = ti.description ? secret(ti.description) : secret(String(ti.command || '').split('\n')[0], true);
   const events = [];
   for (const rel of candidates) {
     if (events.length >= MAX_SHELL_CHANGES * 2) break;
@@ -292,12 +558,27 @@ function readOrNull(file) {
 // Session-level events: a turn ending, subagents starting and stopping, and
 // Claude asking for permission or input. They drive the extension's notifications.
 const SESSION_EVENTS = {
+  UserPromptSubmit: 'prompt', // a turn starts
   Stop: 'turnEnd',
+  StopFailure: 'turnEnd', // the turn ended in an API error
   SubagentStart: 'subagentStart',
   SubagentStop: 'subagentEnd',
   Notification: 'attention',
 };
 const MAX_MESSAGE = 300;
+const MAX_TASKS = 50;
+
+// The background tasks still going when a turn or subagent ends, as Claude
+// Code lists them (Stop and SubagentStop). The extension uses it to tell which
+// background commands have ended, since nothing else reports that.
+function runningTasks(list) {
+  if (!Array.isArray(list)) return undefined; // an older Claude Code, or the list couldn't be read
+  return list.slice(0, MAX_TASKS).map((t) => ({
+    id: t.id,
+    type: t.type,
+    command: typeof t.command === 'string' ? secret(t.command.slice(0, 2000), true) : undefined,
+  }));
+}
 
 function buildSessionEvent(input) {
   const ev = {
@@ -306,14 +587,29 @@ function buildSessionEvent(input) {
     cwd: input.cwd,
     ts: Date.now(),
   };
+  if (ev.type === 'prompt') return ev; // when, not what: the prompt itself is in Claude Code's transcript
+  if (input.hook_event_name === 'StopFailure') {
+    ev.failed = true;
+    ev.error = String(input.error || 'unknown').slice(0, 100); // rate_limit, authentication_failed, …
+  }
+  const tasks = runningTasks(input.background_tasks);
+  if (tasks) ev.tasks = tasks;
   const text = input.last_assistant_message || input.message;
   if (typeof text === 'string' && text.trim()) {
-    ev.message = text.length > MAX_MESSAGE ? text.slice(0, MAX_MESSAGE) + '…' : text;
+    ev.message = secret(text.length > MAX_MESSAGE ? text.slice(0, MAX_MESSAGE) + '…' : text);
   }
   if (input.agent_id) ev.agentId = input.agent_id;
   if (input.agent_type) ev.agentType = input.agent_type;
   if (input.notification_type) ev.kind = input.notification_type;
   return ev;
+}
+
+// Claude's Monitor tool (a script it leaves watching in the background) reaches
+// hooks registered for Bash when it starts, with `timeout_ms` where Bash has
+// `timeout`. Nothing is sent when it ends.
+function isMonitor(input) {
+  const ti = input.tool_input || {};
+  return input.tool_name === 'Monitor' || (ti.timeout_ms !== undefined && ti.timeout === undefined);
 }
 
 function buildEvent(input) {
@@ -334,10 +630,11 @@ function buildEvent(input) {
       return {
         ...base,
         type: 'start',
-        command: ti.command,
-        description: ti.description,
+        command: secret(ti.command, true),
+        description: secret(ti.description),
         background: !!ti.run_in_background,
-        timeout: ti.timeout,
+        timeout: ti.timeout ?? ti.timeout_ms,
+        monitor: isMonitor(input) || undefined,
         cwd: input.cwd,
         transcript: input.transcript_path,
       };
@@ -348,24 +645,24 @@ function buildEvent(input) {
         ...base,
         type: 'end',
         failed: input.hook_event_name === 'PostToolUseFailure',
-        command: ti.command, // lets the extension pair start/end if tool_use_id is missing
+        command: secret(ti.command, true), // lets the extension pair start/end if tool_use_id is missing
         durationMs: input.duration_ms,
       };
       if (input.is_interrupt) ev.interrupted = true;
       if (r && typeof r === 'object') {
-        ev.stdout = clip(r.stdout);
-        ev.stderr = clip(r.stderr);
+        ev.stdout = secret(clip(r.stdout));
+        ev.stderr = secret(clip(r.stderr));
         ev.interrupted = r.interrupted;
         ev.exitCode = r.exitCode ?? r.exit_code ?? r.code;
         ev.backgroundTaskId = r.backgroundTaskId;
         ev.outputFile = r.outputFile || r.output_file || r.outputPath;
         ev.responseKeys = Object.keys(r);
       } else if (r !== undefined) {
-        ev.stdout = clip(String(r));
+        ev.stdout = secret(clip(String(r)));
       }
       if (input.error) {
         const err = typeof input.error === 'string' ? input.error : JSON.stringify(input.error);
-        ev.error = clip(err);
+        ev.error = secret(clip(err));
         // Bash failures arrive as "Exit code N\n<output>"
         const m = /^Exit code (\d+)/.exec(err);
         if (m && ev.exitCode == null) ev.exitCode = Number(m[1]);
@@ -433,7 +730,12 @@ function clipInput(ti) {
   return out;
 }
 
+// Requests that need more than Allow or Deny (an answer to a question, a plan
+// to approve) are left to Claude Code.
+const ASKED_IN_CLAUDE_CODE = new Set(['AskUserQuestion', 'ExitPlanMode']);
+
 async function askVsCode(input) {
+  if (ASKED_IN_CLAUDE_CODE.has(input.tool_name)) return;
   if (inVsCodePanel(input.session_id)) return;
   const timeout = listenerTimeout(input.cwd);
   if (!timeout) return;
@@ -470,6 +772,12 @@ async function askVsCode(input) {
   }
 }
 
+// Loaded by the tests rather than run by Claude Code.
+if (require.main !== module) {
+  module.exports = { readOnly, splitSteps, gitState, repoRoot, shellTarget, redact };
+  return;
+}
+
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => (raw += chunk));
@@ -493,6 +801,7 @@ process.stdin.on('end', async () => {
       await askVsCode(input);
       process.exit(0);
     }
+    masking = readConfig().maskSecrets !== false;
     const ev = buildEvent(input);
     const events = ev ? [ev] : [];
     if (SHELL_TOOLS.has(input.tool_name)) {

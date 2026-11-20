@@ -56,7 +56,7 @@ function liveSessions() {
     try {
       const s = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8'));
       if (s.sessionId && s.pid && isAlive(s.pid)) {
-        live.set(s.sessionId, { pid: s.pid, status: s.status, entrypoint: s.entrypoint, cwd: s.cwd });
+        live.set(s.sessionId, { pid: s.pid, status: s.status, entrypoint: s.entrypoint, cwd: s.cwd, startedAt: s.startedAt });
       }
     } catch {}
   }

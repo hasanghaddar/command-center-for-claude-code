@@ -3,10 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { state, setActiveTerminal, userTerminal, wait, fakeStore, runningCommand } = require('./stub-vscode');
-const { TerminalManager, commandLabel } = require('../extension.js')._internals;
+const { TerminalManager, commandLabel, groupBySession, foldQuick } = require('../extension.js')._internals;
 
+// revealTabs is on here (it is off by default): most of these tests are about which tab comes to the front.
 function setup(config) {
-  state.config = { autoOpenForeground: true, autoOpenBackground: true, autoOpenDelay: 0, commandTabs: 'perCommand', ...config };
+  state.config = { autoOpenForeground: true, autoOpenBackground: true, autoOpenDelay: 0, commandTabs: 'perCommand', revealTabs: true, ...config };
   state.terminals.length = 0;
   state.shown.length = 0;
   state.activeTerminal = undefined;
@@ -100,6 +101,79 @@ test('closing our own finished tab does not count as the user choosing their ter
   await wait();
   assert.equal(state.shown.at(-1), 'Claude: cmd C');
   manager.dispose();
+});
+
+test('by default tabs open without coming to the front, and the one being read stays open', async () => {
+  const { manager, start, finish } = setup({ revealTabs: false });
+  const a = start('cmd A');
+  await wait();
+  assert.deepEqual(state.shown, [], 'the terminal panel is left alone');
+  const tabA = manager.terminals.get(a.id).terminal;
+  assert.ok(tabA, 'the tab is in the terminal list');
+
+  setActiveTerminal(tabA); // the user picks it in the list
+  finish(a);
+  const b = start('cmd B');
+  await wait();
+  assert.equal(tabA.disposed, false, 'not closed under the reader');
+  assert.deepEqual(state.shown, []);
+
+  setActiveTerminal(manager.terminals.get(b.id).terminal);
+  finish(b);
+  start('cmd C');
+  await wait();
+  assert.equal(tabA.disposed, true, 'closed once the user has moved on');
+  manager.dispose();
+});
+
+test('opening finished commands one after another reuses one tab', async () => {
+  const { manager, start, finish } = setup({ autoOpenForeground: false });
+  const [a, b, c] = ['cmd A', 'cmd B', 'cmd C'].map((label) => start(label));
+  for (const rec of [a, b, c]) finish(rec);
+  const server = start('npm run dev', { background: true, status: 'background' });
+
+  manager.open(a);
+  manager.open(b);
+  await wait();
+  const tab = (rec) => state.terminals.find((t) => t.name === `Claude: ${rec.command}`);
+  assert.deepEqual(state.shown, ['Claude: cmd A', 'Claude: cmd B']);
+  assert.equal(tab(a).disposed, true, 'the first is replaced');
+  assert.equal(tab(b).disposed, false);
+
+  manager.open(server); // a running process keeps its tab
+  manager.open(c);
+  await wait();
+  assert.equal(tab(b).disposed, true);
+  assert.equal(tab(server).disposed, false);
+  for (const t of manager.terminals.values()) t.dispose();
+  manager.dispose();
+});
+
+test('the Commands view groups commands by session and folds runs of quick ones', () => {
+  const now = Date.now();
+  let n = 0;
+  const rec = (session, ms, extra = {}) => ({ id: `r${++n}`, session, status: 'ok', startTs: now - n * 1000, endTs: now - n * 1000 + ms, ...extra });
+  const records = [
+    rec('s1', 5000), // newest
+    rec('s1', 100),
+    rec('s1', 200),
+    rec('s1', 300),
+    rec('s2', 100),
+    rec('s1', 100, { status: 'failed' }),
+    rec('s1', 100),
+    rec('s1', 100),
+    rec(undefined, 100),
+  ];
+  const groups = groupBySession(records);
+  assert.deepEqual(groups.map((g) => [g.id, g.records.length, g.first]), [['s1', 7, true], ['s2', 1, false], ['', 1, false]]);
+
+  const rows = foldQuick(groups[0].records);
+  assert.deepEqual(
+    rows.map((r) => (r.kind === 'quick' ? `quick:${r.records.length}` : r.status)),
+    ['ok', 'quick:3', 'failed', 'ok', 'ok'],
+    'three quick ones in a row fold; a failure, a slow one or a shorter run does not'
+  );
+  assert.equal(rows[1].id, 'r4', 'named after its oldest command, so it stays the same row as it grows');
 });
 
 test('with a delay, only commands still running after it get a tab', async () => {

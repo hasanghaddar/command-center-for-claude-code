@@ -22,14 +22,16 @@ One place in VS Code to watch, control and feed context to Claude Code:
 
 **Commands**
 - A **Command Center** sidebar and a full **dashboard** tab listing every Bash and PowerShell command Claude runs: status, folder, duration, exit code and colored output.
+- In the sidebar and the dashboard, commands sit **under the session that ran them**, and runs of quick successful ones (`git status`, `ls`, …) fold into one row, so the slow, failed and running ones stand out. Set `claudeCommandCenter.commandList` to `flat` for one plain list.
 - Click the **Running**, **Background** or **Failed** counts to filter. Search with `/`, move with ↑/↓.
-- **Live output**: a command Claude runs for more than 2 seconds opens a tab that streams its output as it runs. When the next one opens, tabs of finished ones close (reopen them from the list). While you're on a terminal of your own, these tabs open in the terminal list without coming to the front; select one to follow them again.
+- **Live output**: a command Claude runs for more than 2 seconds gets a tab that streams its output as it runs, and the status bar names it with its running time. The tab waits in the terminal list, so the terminal panel never opens by itself: click the status bar, or the tab, to watch. When the next command's tab opens, tabs of finished ones close (the one you're reading stays). Turn on `claudeCommandCenter.revealTabs` to have each tab come to the front instead.
+- Opening finished commands from the list **reuses one tab** rather than leaving a tab open for each.
 - **One shared tab** if you prefer: set `claudeCommandCenter.commandTabs` to `shared` and regular commands print into a single tab, one below the other, with the tab's title following the current one.
 - **Failed commands** show as a count in the status bar for 10 minutes, until you open their output. Click it to see what failed.
-- **Background processes** (dev servers, watchers) stream their output live, open a log tab automatically, and switch to done or failed when they exit.
+- **Background processes** (dev servers, watchers) stream their output live, get a log tab automatically, and switch to done or failed when they exit. One left behind by a Claude Code session that has closed is marked ended once its process is gone.
 - **CPU and memory** of running commands, summed over everything they started, in the list and the tab title, with peak memory when they finish. Measured only while the window is focused and you're looking (the Commands view or the command's tab), every 10 seconds on Windows and 3 on macOS and Linux, and less often for long-running processes or on a busy machine. Turn off with `claudeCommandCenter.resourceUsage`.
 - **Stop** a background process. It finds the exact process Claude started and stops its whole process tree, after asking you.
-- **Dev servers**: when a background process prints a local address (`http://localhost:5173`), you're offered **Open in Browser** or **Open in VS Code**. The address also shows in the list.
+- **Dev servers**: when a background process prints a local address (`http://localhost:5173`), you're offered **Open in Browser** or **Open in VS Code**. The address also shows in the list. **Don't Offer Again** stops the offer for that address in this workspace.
 - **Run again in my terminal** pastes the command into a real terminal without running it. **Live feed** prints every command as it happens.
 
 **File changes**
@@ -50,6 +52,9 @@ One place in VS Code to watch, control and feed context to Claude Code:
 
 **Notifications**
 - When Claude **finishes a turn**, or **needs permission or an answer**, in a project open in that window. By default only while the window isn't focused, and for a finished turn only if it took 30 seconds or more.
+- A notification raised while you're away is shown **when you come back to the window**, and only if it still applies: one per session, none for a session Claude has carried on in, and a single one when several sessions are waiting.
+- While Claude waits for permission or an answer, the status bar shows **Claude needs you** until that session carries on. Click it to open the session.
+- **System notifications** (off by default, `claudeCommandCenter.systemNotifications`): the operating system also notifies you while the window isn't the one in front, so you see it from another app. On Windows, clicking it brings the project's window forward.
 - Optionally when a **subagent finishes**, if it ran longer than a minute.
 
 **Answer permission prompts from VS Code** (off by default, `claudeCommandCenter.answerPermissions`)
@@ -57,7 +62,7 @@ One place in VS Code to watch, control and feed context to Claude Code:
 - There is no "always allow". If you don't answer within 60 seconds (`permissionTimeoutSeconds`), the prompt appears in the terminal as usual. If no window with the project open has this turned on, nothing changes.
 
 **Usage**
-- The status bar shows the output tokens Claude Code used on this machine in the last 5 hours. Hover for input, cache and totals for 5 hours, today and 7 days, and a per-model breakdown.
+- The Command Center status bar item shows the output tokens Claude Code used on this machine in the last 5 hours. Hover for input, cache and totals for 5 hours, today and 7 days, and a per-model breakdown.
 
 **Add to Claude Chat**
 - Right-click files or folders in the Explorer, an editor tab, or selected lines in the editor.
@@ -75,7 +80,7 @@ One place in VS Code to watch, control and feed context to Claude Code:
 
 **What setup changes**
 - Copies a small logging hook to `~/.claude/command-center/hook/log-hook.js`. It's refreshed on every update.
-- Registers it in `~/.claude/settings.json` for Claude Code's `PreToolUse`, `PostToolUse` and `PostToolUseFailure` hooks (commands and edits), `Stop`, `SubagentStart`, `SubagentStop` and `Notification` (for notifications), and `PermissionRequest` (which does nothing unless you turn on answering permission prompts from VS Code). Your other settings and hooks are left alone, and the previous file is saved as `settings.json.bak-command-center`.
+- Registers it in `~/.claude/settings.json` for Claude Code's `PreToolUse`, `PostToolUse` and `PostToolUseFailure` hooks (commands and edits), `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop` and `Notification` (when a turn starts and ends, which background commands are still running, and notifications), and `PermissionRequest` (which does nothing unless you turn on answering permission prompts from VS Code). `StopFailure` (a turn that ends in an API error) is added once every Claude Code on the machine is version 2.1.78 or later. Your other settings and hooks are left alone, and the previous file is saved as `settings.json.bak-command-center`.
 - Adds the Alt+K terminal shortcut to `terminal.integrated.commandsToSkipShell` in your VS Code settings.
 
 Run **Command Center: Set Up Hooks** to redo it, or **Command Center: Remove Hooks** to undo it. Uninstalling the extension removes the hooks automatically.
@@ -92,8 +97,10 @@ Everything stays on your machine. The extension makes no network requests and se
 It reads Claude Code's own session transcripts in `~/.claude/projects` for the Sessions list and token usage, and never changes them, except when you **move** a session.
 
 What gets recorded, in `~/.claude/command-center/log/`:
-- **Every command Claude runs, in full, with its output.** If a command contains a token or password, for example a `curl` with an `Authorization` header, it is recorded too.
-- **Copies of files before and after each edit** (`snapshots/`), so diffs can be shown. Files over 5 MB are skipped. Before each shell command in a git repository, files that already differ from the last commit are copied too (each version stored once), so the command's changes can be told apart from earlier ones.
+- **Every command Claude runs, with its output.** Secrets are masked (`***`) before anything is written: passwords in URLs, `Authorization` headers, values of settings named like a secret (`API_KEY=…`, `--password …`, `"token": "…"`), keys recognisable by their shape (GitHub, AWS, Anthropic, …) and private keys. In output and in edited text, a named value is masked only if it looks like a secret (six or more characters with letters and digits), so ordinary code that mentions `password` or `token` stays readable. This catches the common cases, not every possible secret. Turn it off with `claudeCommandCenter.maskSecrets`.
+- What was recorded before version 0.15 is masked the same way, once, shortly after the update.
+- **When you send a prompt** (the time, not the text), to measure how long a turn took.
+- **Copies of files before and after each edit** (`snapshots/`), so diffs can be shown. These are the files as they are, a `.env` included: nothing in them is masked. Files over 5 MB are skipped. Before each shell command in a git repository, files that already differ from the last commit are copied too (each version stored once), so the command's changes can be told apart from earlier ones.
 - **The first 300 characters of Claude's last message** at the end of each turn and subagent, and the text of permission prompts, to show in notifications.
 - **Copies of files you revert**, taken just before the revert so it can be undone (`reverts/`).
 - **The text you send with Add to Claude Chat** (`context/`), such as terminal selections, because the chat receives a link to a file rather than the text itself.
@@ -101,7 +108,7 @@ What gets recorded, in `~/.claude/command-center/log/`:
 How long it is kept:
 - Edit snapshots and revert copies: 7 days (`claudeCommandCenter.retentionDays`). A session can only be reverted while its snapshots are kept.
 - Chat files: 24 hours (`claudeCommandCenter.chatFileRetentionHours`).
-- The command history rotates at 20 MB.
+- The command history (commands, their output, and the list of file changes): 30 days (`claudeCommandCenter.historyDays`), and never more than about 40 MB.
 - **Clear History** (the trash icon in the sidebar) deletes all of it at once.
 
 ## Settings
@@ -111,22 +118,28 @@ How long it is kept:
 | `claudeCommandCenter.scope` | `workspace` | Show only this window's projects, or `all`. |
 | `claudeCommandCenter.autoOpenBackground` | `true` | Open a live log tab when Claude starts a background process. |
 | `claudeCommandCenter.autoOpenForeground` | `true` | Open a tab when Claude starts a regular command. Output streams live, and the tab closes when the next command opens. |
+| `claudeCommandCenter.revealTabs` | `false` | Bring each command's tab to the front (opening the terminal panel). Off: tabs wait in the terminal list and the status bar names the running command. |
 | `claudeCommandCenter.autoOpenDelay` | `2` | Seconds a regular command must have been running before its tab opens. `0` opens every command at once. |
 | `claudeCommandCenter.commandTabs` | `perCommand` | `shared` prints all regular commands into one tab. Background processes always get their own. |
 | `claudeCommandCenter.showFailures` | `true` | Count recently failed commands in the status bar. |
 | `claudeCommandCenter.resourceUsage` | `true` | Show CPU and memory of running commands. Only measured while you're looking. |
 | `claudeCommandCenter.retentionDays` | `7` | Days to keep edit snapshots. `0` keeps them forever. |
+| `claudeCommandCenter.historyDays` | `30` | Days to keep recorded commands, their output and the list of file changes. `0` keeps them until the size limit (about 40 MB). |
+| `claudeCommandCenter.maskSecrets` | `true` | Mask passwords, tokens and keys before a command or its output is recorded. |
 | `claudeCommandCenter.chatFileRetentionHours` | `24` | Hours to keep files made for chat mentions. `0` keeps them forever. |
 | `claudeCommandCenter.maxItems` | `200` | Most items shown per list. |
+| `claudeCommandCenter.commandList` | `grouped` | `grouped` lists commands under their session and folds quick ones. `flat` is one list, newest first. |
 | `claudeCommandCenter.notifyTurnEnd` | `unfocused` | Notify when Claude finishes a turn: `always`, `unfocused` or `never`. |
 | `claudeCommandCenter.notifyTurnMinSeconds` | `30` | Skip turns shorter than this, counted from your prompt. `0` notifies for every turn. |
 | `claudeCommandCenter.notifyAttention` | `unfocused` | Notify when Claude needs permission or an answer. |
 | `claudeCommandCenter.notifySubagentEnd` | `never` | Notify when a subagent finishes. |
 | `claudeCommandCenter.notifySubagentMinSeconds` | `60` | Skip subagents shorter than this. |
+| `claudeCommandCenter.systemNotifications` | `false` | Also notify through the operating system while the window isn't in front. |
 | `claudeCommandCenter.answerPermissions` | `false` | Answer terminal sessions' permission prompts from VS Code. |
 | `claudeCommandCenter.permissionTimeoutSeconds` | `60` | How long a terminal session waits for that answer before asking in the terminal. |
 | `claudeCommandCenter.notifyServerUrl` | `always` | Offer to open a dev server's local address. |
 | `claudeCommandCenter.showUsage` | `true` | Show token usage in the status bar. |
+| `claudeCommandCenter.terminalButton` | `true` | Show the @ button in the terminal toolbar. |
 | `claudeCommandCenter.sessionDays` | `30` | List sessions active in the last this many days. |
 | `claudeCommandCenter.logDir` | | Where the history is read from. Empty means `~/.claude/command-center/log`. |
 
@@ -140,7 +153,13 @@ How long it is kept:
 - **Usage is tokens, not a quota percentage.** Your plan's 5-hour and weekly limits aren't stored locally, so the extension can't show how close you are to them.
 - **Open session** uses the Claude Code panel only for sessions in this window's folders; others open in a terminal. A session must be closed before it can be moved, and file paths mentioned earlier in a moved conversation keep their old location.
 - **Answering permission prompts**: while VS Code is asking, the terminal shows no prompt; it appears there once the wait runs out. Answer in one place only.
-- **Notifications** need the hook from this version: accept the "Update" prompt after upgrading, then start a new Claude Code session.
+- **System notifications** appear under the editor's name on Windows for VS Code and VS Code Insiders, and under "Windows PowerShell" for other editors; on macOS under "Script Editor". Clicking one opens the project only on Windows. They take a few seconds to appear on Windows. Linux needs `notify-send`. Tested on Windows only.
+- **After an upgrade** the hook is updated by itself, but Claude Code sessions that were already open keep the old one until they are restarted.
+- **"Claude needs you"**: Claude Code doesn't report that a permission prompt was answered, so it clears on the first sign that the session carried on: the command it asked about starts printing or finishes, Claude starts something else, a new prompt is sent, or the turn ends. Without any of those it clears after 10 minutes.
+- **Run again in my terminal** pastes the command as recorded. If a secret in it was masked, put the real value back before running it.
+- **Background commands** are marked ended when Claude Code stops listing them at the end of a turn, so one that ends mid-turn without an exit code shows as running until that turn ends.
+- **Watchers Claude starts with its Monitor tool** are listed as background commands marked "watching". Claude Code doesn't report what they print or when they end, so they show no output. They are marked ended when Claude Code stops listing them at the end of a turn, at their timeout, or when their session closes.
+- **Files changed by shell commands** aren't looked for after commands that can't change files (`ls`, `cat`, `grep`, `git status`, …), which keeps the hook fast. A command is only treated that way when every step of it is on a short list and nothing is redirected to a file.
 - **Folders** can't be sent to the Claude chat directly. Their `@folder/` mention is copied to the clipboard for you to paste.
 
 ## Troubleshooting

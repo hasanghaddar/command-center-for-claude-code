@@ -28,6 +28,13 @@ const state = {
 };
 
 const activeTerminalChanged = new EventEmitter();
+const windowStateChanged = new EventEmitter();
+
+// The window gains or loses focus, as when the user switches to or from another app.
+function setFocused(focused) {
+  state.focused = focused;
+  windowStateChanged.fire({ focused });
+}
 
 // Make a terminal the active one, as when the user clicks its tab.
 function setActiveTerminal(t) {
@@ -91,6 +98,7 @@ const windowApi = {
     return { focused: state.focused };
   },
   onDidChangeActiveTerminal: activeTerminalChanged.event,
+  onDidChangeWindowState: windowStateChanged.event,
   createTerminal,
   createStatusBarItem() {
     const item = { text: '', tooltip: undefined, visible: false, show: () => (item.visible = true), hide: () => (item.visible = false), dispose() {} };
@@ -135,6 +143,7 @@ function fakeStore() {
     records: new Map(),
     changes: new Map(),
     turnEnds: new Map(),
+    turnStarts: new Map(),
     onRecord: record.event,
     onSessionEvent: session.event,
     inScope: () => true,
@@ -149,4 +158,4 @@ function runningCommand(label, extra = {}) {
   return { id: `rec${++nextId}`, tool: 'Bash', command: label, description: '', status: 'running', startTs: Date.now(), session: 'session-1', ...extra };
 }
 
-module.exports = { vscode, state, EventEmitter, setActiveTerminal, userTerminal, wait, fakeStore, runningCommand };
+module.exports = { vscode, state, EventEmitter, setActiveTerminal, setFocused, userTerminal, wait, fakeStore, runningCommand };
