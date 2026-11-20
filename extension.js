@@ -274,7 +274,7 @@ class Store {
       if (now - (rec.orphanChecked || 0) < ORPHAN_RECHECK_MS) continue;
       let quietSince = 0;
       try {
-        quietSince = fs.statSync(rec.outputFile).mtimeMs;
+        quietSince = Math.round(fs.statSync(rec.outputFile).mtimeMs); // whole milliseconds: some file systems report fractions
       } catch {}
       if (now - quietSince < ORPHAN_QUIET_MS) continue;
       live = live || this.deps.liveSessions();
@@ -1004,8 +1004,8 @@ function readExitMarker(file) {
     fs.closeSync(fd);
     const tail = buf.toString('utf8');
     const m = /\[exited with code (-?\d+)\]\s*$/.exec(tail);
-    if (m) return { code: Number(m[1]), mtime: st.mtimeMs };
-    if (/\[(killed|stopped|terminated|interrupted)[^\]\n]*\]\s*$/i.test(tail)) return { code: null, mtime: st.mtimeMs };
+    if (m) return { code: Number(m[1]), mtime: Math.round(st.mtimeMs) };
+    if (/\[(killed|stopped|terminated|interrupted)[^\]\n]*\]\s*$/i.test(tail)) return { code: null, mtime: Math.round(st.mtimeMs) };
   } catch {}
   return null;
 }
